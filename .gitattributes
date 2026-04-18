@@ -1,0 +1,7 @@
+# Принудительно LF для всех текстовых файлов (Docker = Linux)
+* text=auto eol=lf
+
+# Бинарники не трогаем
+*.png binary
+*.jpg binary
+*.gz binary
