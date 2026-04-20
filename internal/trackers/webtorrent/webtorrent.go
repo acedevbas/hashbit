@@ -197,6 +197,14 @@ func readMatchingReply(ctx context.Context, conn *websocket.Conn, want []byte) (
 			// Right hash, wrong frame type (e.g. server ack without counts).
 			continue
 		}
+		// Self-echo compensation: we announced event=started as a "leecher"
+		// (left>0 implied) so every reply includes ourselves in `incomplete`.
+		// Production DB shows 100 % of observed rows have leechers≥1 even on
+		// dead hashes — that's us. Subtract 1 to recover the real leecher count.
+		// Seeders (`complete`) do not include us since we didn't claim completed.
+		if incomplete > 0 {
+			incomplete--
+		}
 		return clip32(complete), clip32(incomplete), true
 	}
 }

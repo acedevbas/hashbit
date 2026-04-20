@@ -125,7 +125,7 @@ func Load() (*Config, error) {
 	if c.WebTorrentBatchSize, err = atoi("WEBTORRENT_BATCH_SIZE", "50"); err != nil {
 		return nil, err
 	}
-	if c.WebTorrentConcurrency, err = atoi("WEBTORRENT_CONCURRENCY", "8"); err != nil {
+	if c.WebTorrentConcurrency, err = atoi("WEBTORRENT_CONCURRENCY", "32"); err != nil {
 		return nil, err
 	}
 
