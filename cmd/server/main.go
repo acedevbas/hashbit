@@ -151,15 +151,26 @@ func main() {
 	// socket) so discovery traffic does not starve the scrape pool.
 	// Discovered hashes land in the `discovered_hashes` table — the operator
 	// promotes them into `infohashes` on their own schedule.
+	//
+	// NodePool is shared across every DHT client in the process: each
+	// client's KRPC dispatcher calls pool.Observe on every "nodes" entry
+	// it sees, which gives the crawler a warm seed of real BT clients
+	// harvested from ongoing scrape traffic. Without this the crawler
+	// would be stuck seeding from Mainline DHT bootstrap routers, which
+	// deliberately do not implement sample_infohashes.
 	var bep51Client *dht.Client
 	if cfg.DHTBEP51Enabled {
+		nodePool := dht.NewNodePool(4096)
+		dhtSc.SetNodeObserver(nodePool.Observe)
+
 		c, err := dht.NewClient()
 		if err != nil {
 			log.Error("bep51 client", "err", err)
 		} else {
 			bep51Client = c
+			bep51Client.SetNodeObserver(nodePool.Observe)
 			defer func() { _ = bep51Client.Close() }()
-			crawler := dht.NewBEP51Crawler(bep51Client, pool, log, dht.BEP51CrawlerOptions{
+			crawler := dht.NewBEP51Crawler(bep51Client, nodePool, pool, log, dht.BEP51CrawlerOptions{
 				Interval:     cfg.DHTBEP51Interval,
 				MaxNodes:     cfg.DHTBEP51MaxNodes,
 				Alpha:        cfg.DHTBEP51Alpha,

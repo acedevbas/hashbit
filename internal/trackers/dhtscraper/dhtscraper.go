@@ -27,6 +27,7 @@ package dhtscraper
 import (
 	"context"
 	"encoding/hex"
+	"net"
 	"sync"
 	"time"
 
@@ -241,6 +242,19 @@ func (s *Scraper) PeersForHash(ctx context.Context, hexHash string) ([]string, e
 	}
 	return out, nil
 }
+
+// SetNodeObserver wires a shared NodePool observer into every DHT client
+// in the scraper's pool so scrape traffic feeds the BEP 51 crawler's seed
+// pool for free. Called once from main after both scraper and pool are
+// constructed. Passing nil clears the hook.
+func (s *Scraper) SetNodeObserver(fn func(addr *net.UDPAddr, id dht.NodeID)) {
+	for _, c := range s.clients {
+		c.SetNodeObserver(fn)
+	}
+}
+
+// suppress unused-import when net is only referenced via the signature.
+var _ = net.IPv4
 
 // Close releases every underlying DHT socket. Safe to call once at shutdown.
 func (s *Scraper) Close() error {

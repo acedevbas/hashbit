@@ -2,39 +2,46 @@ package dht
 
 // BEP 51 sample_infohashes crawler.
 //
-// BEP 51 lets a node ask "what infohashes do you know about?" and returns a
-// sampled subset (per-node) of its stored hashes. Each compliant node
-// responds with ~20 random samples from its storage table, which on a hot
-// node can mean thousands of distinct hashes worth of content per hour of
-// crawling. Very few hashes in a real BitTorrent swarm collide across
-// responders — samples from a well-distributed walk yield mostly fresh
-// content.
+// BEP 51 lets a node advertise a random subset of the infohashes it is
+// currently tracking. Issuing sample_infohashes at every DHT node we can
+// reach yields a steady stream of fresh infohashes that are alive on the
+// public network RIGHT NOW — a near-free discovery channel that does not
+// touch any tracker.
 //
-// Crawling strategy:
-//   - Generate a random 20-byte `target` (it's purely for protocol shape —
-//     BEP 51 responders return samples regardless of target value, per spec).
-//   - Seed a short BFS from known bootstrap nodes (or a persistent pool).
-//   - At each visited node: issue sample_infohashes; collect the node's
-//     samples and its `nodes` field (closer nodes) into the frontier.
-//   - Expand until we've visited N nodes or a time budget elapses.
-//   - Every discovered hash is UPSERT'ed into `discovered_hashes`. Novel
-//     rows increment the Prometheus discovery counter.
+// Why the first implementation failed:
 //
-// Ethics: BEP 51 samples are voluntarily advertised by responding nodes.
-// We are not scraping anyone's private data; we are participating in the
-// public DHT as BEP 5 envisions. The `discovered_hashes` table is a log
-// of public metadata; no content is ever downloaded.
+//	Mainline DHT bootstrap nodes (router.bittorrent.com, dht.libtorrent.org,
+//	...) answer find_node and get_peers but intentionally do NOT implement
+//	sample_infohashes. Seeding a BFS from them therefore produces zero
+//	samples: every bootstrap call returns error, the frontier never expands
+//	into real BT clients, the cycle exits after ~7 visited nodes with 0
+//	responses.
 //
-// Trade-offs:
-//   - We use a dedicated Client so crawler traffic does not starve the
-//     scrape pool's UDP socket.
-//   - One crawl cycle visits ~maxNodes distinct nodes and takes ~maxNodes
-//     * queryTimeout / alpha wall-clock, which at the defaults below caps
-//     a cycle at ~1 minute for ~100 nodes.
-//   - Cycle cadence is conservative (10m by default) — more frequent
-//     crawls hit diminishing returns quickly because BEP 51 samples are
-//     drawn without replacement per-node and the same 50 hot nodes
-//     account for most of the keyspace.
+// The fix has three pieces:
+//
+//  1. NodePool: a shared, bounded in-memory index of DHT node endpoints
+//     observed via our ordinary scrape traffic (get_peers' "nodes" field
+//     from every live BT client we query for peers). Ordinary scrapes
+//     populate it for free — the pool warms up to thousands of real
+//     participating nodes within minutes.
+//
+//  2. find_node warmup: if the pool is too cold (fewer than minSeed
+//     entries) we do a short iterative find_node walk from bootstraps.
+//     find_node is implemented by 100% of DHT nodes, so this reliably
+//     lands us in the real-client graph in 1-2 rounds and further feeds
+//     the shared pool.
+//
+//  3. Pool-seeded BFS: the crawler samples N addresses from the pool
+//     (biased toward nodes that have previously answered BEP 51) and
+//     issues sample_infohashes. Successes flip the pool entry's
+//     `bep51Known` flag so subsequent cycles front-load productive
+//     responders, compounding the hit-rate over time.
+//
+// Ethics: BEP 51 responses are voluntary — a node only advertises what it
+// has chosen to keep. We are not scraping anyone's private metadata; we
+// are participating in Mainline DHT the way every modern BT client does.
+// The `discovered_hashes` table is a log of public metadata; no content is
+// ever downloaded.
 
 import (
 	"context"
@@ -55,57 +62,66 @@ import (
 // sensible defaults.
 type BEP51CrawlerOptions struct {
 	Interval     time.Duration // between cycles (default 10m)
-	MaxNodes     int           // unique nodes visited per cycle (default 100)
-	Alpha        int           // parallel queries (default 8)
-	QueryTimeout time.Duration // per sample_infohashes call (default 2s)
+	MaxNodes     int           // unique nodes sampled per cycle (default 200)
+	Alpha        int           // parallel queries (default 16)
+	QueryTimeout time.Duration // per KRPC call (default 2s)
+	MinSeedPool  int           // pool size below which warmup runs (default 64)
+	WarmupNodes  int           // nodes to collect during cold-start warmup (default 200)
 }
 
-// BEP51Crawler orchestrates periodic BEP 51 sample harvest. Construct via
-// NewBEP51Crawler, wire a dht.Client for the UDP socket, and Run on a
-// background goroutine.
+// BEP51Crawler orchestrates periodic BEP 51 sample harvest.
 type BEP51Crawler struct {
 	client *Client
-	pool   *pgxpool.Pool
+	pool   *NodePool
+	db     *pgxpool.Pool
 	log    *slog.Logger
 	opts   BEP51CrawlerOptions
 }
 
-// NewBEP51Crawler returns a crawler using the supplied Client for its UDP
-// traffic. The client must already be active (its read loop started). The
-// crawler does not close the client on its own.
-func NewBEP51Crawler(client *Client, pool *pgxpool.Pool, log *slog.Logger, opts BEP51CrawlerOptions) *BEP51Crawler {
+// NewBEP51Crawler returns a crawler using the supplied Client for UDP
+// traffic. The pool is shared with other DHT clients — they feed node
+// observations into it, the crawler drains from it. The crawler does not
+// close the client on its own.
+func NewBEP51Crawler(client *Client, pool *NodePool, dbPool *pgxpool.Pool, log *slog.Logger, opts BEP51CrawlerOptions) *BEP51Crawler {
 	if opts.Interval <= 0 {
 		opts.Interval = 10 * time.Minute
 	}
 	if opts.MaxNodes <= 0 {
-		opts.MaxNodes = 100
+		opts.MaxNodes = 200
 	}
 	if opts.Alpha <= 0 {
-		opts.Alpha = 8
+		opts.Alpha = 16
 	}
 	if opts.QueryTimeout <= 0 {
 		opts.QueryTimeout = 2 * time.Second
 	}
+	if opts.MinSeedPool <= 0 {
+		opts.MinSeedPool = 64
+	}
+	if opts.WarmupNodes <= 0 {
+		opts.WarmupNodes = 200
+	}
 	return &BEP51Crawler{
 		client: client,
 		pool:   pool,
+		db:     dbPool,
 		log:    log,
 		opts:   opts,
 	}
 }
 
 // Run blocks until ctx is cancelled, running one crawl cycle per Interval.
-// A cycle is bounded internally so overruns don't skew the next schedule.
 func (c *BEP51Crawler) Run(ctx context.Context) {
 	c.log.Info("bep51 crawler starting",
 		"interval", c.opts.Interval,
 		"max_nodes", c.opts.MaxNodes,
 		"alpha", c.opts.Alpha,
+		"min_seed_pool", c.opts.MinSeedPool,
 	)
-	// Initial delay before the first cycle so we don't hammer the DHT during
-	// container start-up when many sockets are still warming their routing
-	// tables.
-	timer := time.NewTimer(30 * time.Second)
+	// Initial delay before the first cycle so the dhtscraper pool has a
+	// chance to feed the NodePool with observations from the first scrape
+	// tick. Without this the first cycle always takes the warmup path.
+	timer := time.NewTimer(60 * time.Second)
 	defer timer.Stop()
 	for {
 		select {
@@ -118,91 +134,107 @@ func (c *BEP51Crawler) Run(ctx context.Context) {
 	}
 }
 
-// runCycle performs one BFS-bounded walk and records every sample. A cycle
-// is hard-capped at Interval so it cannot eat the next one.
+// runCycle performs one sampling pass. Hard-capped at Interval so a slow
+// cycle never eats the next one.
 func (c *BEP51Crawler) runCycle(ctx context.Context) {
 	cycleCtx, cancel := context.WithTimeout(ctx, c.opts.Interval)
 	defer cancel()
 
 	start := time.Now()
-	var target NodeID
-	if _, err := rand.Read(target[:]); err != nil {
-		c.log.Warn("bep51 target rand", "err", err)
-		return
+
+	// Phase 1: ensure the NodePool has enough entries to seed a meaningful
+	// BFS. If we're cold, run a find_node warmup walk from bootstraps.
+	poolBefore := c.pool.Len()
+	if poolBefore < c.opts.MinSeedPool {
+		c.warmupFindNode(cycleCtx, c.opts.WarmupNodes)
 	}
 
-	// Frontier: nodes we know about but haven't queried yet. seen tracks
-	// addresses we've already enqueued to avoid re-queueing through the
-	// same address via multiple parents.
-	var (
-		mu        sync.Mutex
-		frontier  []node
-		seen      = make(map[string]bool)
-		queried   = make(map[string]bool)
-		samples   = make(map[[IDLen]byte]string) // hash -> source addr
-		novelRows = 0
-		totalRows = 0
-		responses = 0
-	)
+	// Phase 2: pool-seeded sample_infohashes BFS.
+	samples, queried, responses := c.sampleFromPool(cycleCtx)
 
-	bootstraps := BootstrapAddrs()
-	for _, a := range bootstraps {
-		key := a.String()
-		if seen[key] {
+	// Phase 3: persist discovered infohashes.
+	novelRows := 0
+	totalRows := 0
+	writeCtx, writeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	for hashBytes, source := range samples {
+		hashHex := hex.EncodeToString(hashBytes[:])
+		inserted, err := db.RecordDiscoveredHash(writeCtx, c.db, hashHex, source)
+		if err != nil {
+			c.log.Warn("bep51 record", "err", err, "hash", hashHex)
 			continue
 		}
-		seen[key] = true
-		frontier = append(frontier, node{addr: a})
+		totalRows++
+		if inserted {
+			novelRows++
+		}
 	}
-	if len(frontier) == 0 {
-		c.log.Warn("bep51 crawler: no bootstrap resolved")
+	writeCancel()
+	metrics.AddBEP51Discovered(novelRows)
+
+	c.log.Info("bep51 cycle done",
+		"pool_before", poolBefore,
+		"pool_after", c.pool.Len(),
+		"pool_bep51_known", c.pool.BEP51Count(),
+		"visited_nodes", queried,
+		"responses", responses,
+		"samples_unique", len(samples),
+		"rows_written", totalRows,
+		"novel", novelRows,
+		"elapsed", time.Since(start).String(),
+	)
+}
+
+// warmupFindNode walks the DHT from bootstraps via find_node, adding every
+// returned node to the shared pool. Bounded by `want` nodes visited or
+// cycleCtx cancellation.
+//
+// Used only when the pool is cold; after a few minutes of live scraping
+// the pool is populated by the onNodeSeen hook and this runs zero work.
+func (c *BEP51Crawler) warmupFindNode(ctx context.Context, want int) {
+	bootstraps := BootstrapAddrs()
+	if len(bootstraps) == 0 {
 		return
 	}
 
-	// Worker pool that drains the frontier. Using Alpha workers concurrently
-	// strikes a balance: too few makes cycles slow, too many saturates our
-	// UDP socket and forces remote rate-limits.
-	type job struct{ n node }
-	jobs := make(chan job, c.opts.Alpha*4)
+	type task struct{ addr *net.UDPAddr }
+	var (
+		mu       sync.Mutex
+		visited  = make(map[string]bool)
+		frontier []*net.UDPAddr
+	)
+
+	for _, a := range bootstraps {
+		visited[a.String()] = true
+		frontier = append(frontier, a)
+	}
+
+	jobs := make(chan task, c.opts.Alpha*4)
 	var wg sync.WaitGroup
 	for i := 0; i < c.opts.Alpha; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				samplesFound, closer, _, err := c.client.SampleInfoHashes(cycleCtx, j.n.addr, target, c.opts.QueryTimeout)
+				var target NodeID
+				_, _ = rand.Read(target[:])
+				closer, _, err := c.client.FindNode(ctx, j.addr, target, c.opts.QueryTimeout)
 				if err != nil {
 					continue
 				}
 				mu.Lock()
-				responses++
-				metrics.IncBEP51Sample()
-				sourceAddr := j.n.addr.String()
-				for _, s := range samplesFound {
-					if _, ok := samples[s]; ok {
-						continue
-					}
-					samples[s] = sourceAddr
-				}
-				// Expand frontier with closer nodes we haven't queued yet.
 				for _, nn := range closer {
-					if nn.addr == nil {
+					if nn == nil {
 						continue
 					}
-					if !usableIP(nn.addr.IP) || nn.addr.Port == 0 {
+					key := nn.String()
+					if visited[key] {
 						continue
 					}
-					key := nn.addr.String()
-					if seen[key] {
-						continue
-					}
-					if len(seen)-len(queried) >= c.opts.MaxNodes*2 {
-						// Avoid unbounded memory growth on well-connected
-						// parents. seen grows ~2x visited before we stop
-						// expanding.
-						continue
-					}
-					seen[key] = true
+					visited[key] = true
+					// Every FindNode reply also flows through the
+					// server's onNodeSeen hook (via KRPC dispatch), so
+					// the pool picks up this node for us. We still
+					// append to the local frontier for further walking.
 					frontier = append(frontier, nn)
 				}
 				mu.Unlock()
@@ -210,26 +242,24 @@ func (c *BEP51Crawler) runCycle(ctx context.Context) {
 		}()
 	}
 
-	// Dispatcher: pulls from frontier, pushes to workers, stops when we've
-	// visited MaxNodes or the frontier is empty.
 	go func() {
 		defer close(jobs)
 		for {
-			if cycleCtx.Err() != nil {
+			if ctx.Err() != nil {
 				return
 			}
 			mu.Lock()
-			if len(queried) >= c.opts.MaxNodes {
+			if len(visited) >= want {
 				mu.Unlock()
 				return
 			}
 			if len(frontier) == 0 {
 				mu.Unlock()
-				// Give workers a moment to repopulate frontier from their
-				// replies; if after 500ms there's still nothing we're done.
+				// Short wait for workers to replenish frontier from in-
+				// flight replies; exit if no progress after the window.
 				select {
 				case <-time.After(500 * time.Millisecond):
-				case <-cycleCtx.Done():
+				case <-ctx.Done():
 					return
 				}
 				mu.Lock()
@@ -240,51 +270,138 @@ func (c *BEP51Crawler) runCycle(ctx context.Context) {
 			}
 			n := frontier[0]
 			frontier = frontier[1:]
-			key := n.addr.String()
-			if queried[key] {
-				mu.Unlock()
-				continue
-			}
-			queried[key] = true
 			mu.Unlock()
 			select {
-			case jobs <- job{n}:
-			case <-cycleCtx.Done():
+			case jobs <- task{n}:
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
 
 	wg.Wait()
-
-	// Persist collected samples. Doing it after the crawl keeps the UDP
-	// read-path latency clean; a few thousand UPSERTs is fast even on a
-	// cold Postgres instance.
-	writeCtx, writeCancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer writeCancel()
-	for hashBytes, source := range samples {
-		hashHex := hex.EncodeToString(hashBytes[:])
-		inserted, err := db.RecordDiscoveredHash(writeCtx, c.pool, hashHex, source)
-		if err != nil {
-			c.log.Warn("bep51 record", "err", err, "hash", hashHex)
-			continue
-		}
-		totalRows++
-		if inserted {
-			novelRows++
-		}
-	}
-	metrics.AddBEP51Discovered(novelRows)
-
-	c.log.Info("bep51 cycle done",
-		"visited_nodes", len(queried),
-		"responses", responses,
-		"samples_unique", len(samples),
-		"rows_written", totalRows,
-		"novel", novelRows,
-		"elapsed", time.Since(start).String(),
-	)
 }
 
-// unused guard for net.UDPAddr references from other build flavors.
-var _ = net.UDPAddr{}
+// sampleFromPool picks MaxNodes addresses from the NodePool and issues
+// sample_infohashes at each, collecting returned infohashes. Addresses
+// advertised in successful replies are added to the frontier so the walk
+// expands beyond the initial seed. Returns (samples, visited, responses).
+func (c *BEP51Crawler) sampleFromPool(ctx context.Context) (map[[IDLen]byte]string, int, int) {
+	samples := make(map[[IDLen]byte]string)
+	var (
+		mu        sync.Mutex
+		visited   = make(map[string]bool)
+		frontier  []*net.UDPAddr
+		responses int
+	)
+
+	// Initial frontier from the shared pool. Doubled so the BFS has some
+	// headroom if many initial picks fail; the inner MaxNodes cap still
+	// bounds total work.
+	seeds := c.pool.Sample(c.opts.MaxNodes*2, true)
+	for _, a := range seeds {
+		key := a.String()
+		if visited[key] {
+			continue
+		}
+		visited[key] = true
+		frontier = append(frontier, a)
+	}
+	if len(frontier) == 0 {
+		return samples, 0, 0
+	}
+
+	// Random target — BEP 51 responders ignore target in practice, but we
+	// compute a single one per cycle to keep query shape compliant.
+	var target NodeID
+	_, _ = rand.Read(target[:])
+
+	type task struct{ addr *net.UDPAddr }
+	jobs := make(chan task, c.opts.Alpha*4)
+	var wg sync.WaitGroup
+	for i := 0; i < c.opts.Alpha; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				found, closer, _, err := c.client.SampleInfoHashes(ctx, j.addr, target, c.opts.QueryTimeout)
+				if err != nil {
+					continue
+				}
+				mu.Lock()
+				responses++
+				// Any response counts as "this node answered us"; only
+				// non-zero samples flip the bep51Known flag so we don't
+				// pin nodes that reply with empty on every cycle (likely
+				// non-BEP-51 nodes that happened to return y:"r" shape).
+				metrics.IncBEP51Sample()
+				if len(found) > 0 {
+					c.pool.MarkBEP51(j.addr)
+				}
+				sourceAddr := j.addr.String()
+				for _, s := range found {
+					if _, ok := samples[s]; ok {
+						continue
+					}
+					samples[s] = sourceAddr
+				}
+				// Expand frontier with closer nodes — these are fresh
+				// BEP 51 candidates. The onNodeSeen hook in dispatch has
+				// already added them to the pool too.
+				for _, nn := range closer {
+					if nn.addr == nil {
+						continue
+					}
+					if !usableIP(nn.addr.IP) || nn.addr.Port == 0 {
+						continue
+					}
+					key := nn.addr.String()
+					if visited[key] {
+						continue
+					}
+					visited[key] = true
+					frontier = append(frontier, nn.addr)
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			mu.Lock()
+			if len(visited) >= c.opts.MaxNodes {
+				mu.Unlock()
+				return
+			}
+			if len(frontier) == 0 {
+				mu.Unlock()
+				select {
+				case <-time.After(500 * time.Millisecond):
+				case <-ctx.Done():
+					return
+				}
+				mu.Lock()
+				if len(frontier) == 0 {
+					mu.Unlock()
+					return
+				}
+			}
+			n := frontier[0]
+			frontier = frontier[1:]
+			mu.Unlock()
+			select {
+			case jobs <- task{n}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	return samples, len(visited), responses
+}

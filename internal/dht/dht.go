@@ -483,6 +483,39 @@ func (c *Client) Lookup(ctx context.Context, infohash [IDLen]byte, opts Options)
 	return res, nil
 }
 
+// FindNode issues a KRPC find_node query to addr. Returns the closer nodes
+// the remote advertised, the responder's own node id, and any error.
+// Unlike sample_infohashes, find_node is implemented by 100% of compliant
+// DHT nodes (routers included) — ideal for the BEP 51 crawler's cold-
+// start walk from bootstraps.
+func (c *Client) FindNode(ctx context.Context, addr *net.UDPAddr, target NodeID, timeout time.Duration) ([]*net.UDPAddr, NodeID, error) {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	r, err := c.srv.findNode(ctx, addr, target, timeout)
+	if err != nil {
+		return nil, NodeID{}, err
+	}
+	out := make([]*net.UDPAddr, 0, len(r.nodes))
+	for _, nn := range r.nodes {
+		if nn.addr == nil || !usableIP(nn.addr.IP) {
+			continue
+		}
+		out = append(out, nn.addr)
+	}
+	return out, r.nodeID, nil
+}
+
+// SetNodeObserver installs a callback that receives every node address
+// parsed from incoming KRPC replies. Typically wired to a shared NodePool
+// so the BEP 51 crawler inherits seeds from ongoing scrape traffic. Nil
+// clears the hook.
+func (c *Client) SetNodeObserver(fn func(addr *net.UDPAddr, id NodeID)) {
+	c.srv.mu.Lock()
+	c.srv.onNodeSeen = fn
+	c.srv.mu.Unlock()
+}
+
 // SampleInfoHashes issues a BEP 51 sample_infohashes query to addr. The
 // remote node, if it supports BEP 51, returns a list of 20-byte infohashes
 // currently indexed in its routing table plus a list of closer nodes.
@@ -555,6 +588,13 @@ type server struct {
 	// peer echoes our apparent external address in the "ip" response field.
 	// The Client sets this to its rekey hook; leaving it nil is harmless.
 	onObservedIP func(net.IP)
+
+	// onNodeSeen is invoked (if non-nil) for every node address parsed from
+	// an incoming KRPC reply. Used to feed a shared NodePool that the BEP 51
+	// crawler samples from — this turns ordinary scrape traffic into free
+	// seed material for discovery without coupling Client.Lookup to the
+	// crawler. Leaving it nil is harmless.
+	onNodeSeen func(addr *net.UDPAddr, id NodeID)
 }
 
 func newServer(conn *net.UDPConn, selfID NodeID) *server {
@@ -671,10 +711,14 @@ func (s *server) dispatch(data []byte, src *net.UDPAddr) {
 			if port == 0 {
 				continue
 			}
-			resp.nodes = append(resp.nodes, node{
+			nn := node{
 				id:   nid,
 				addr: &net.UDPAddr{IP: ip, Port: int(port)},
-			})
+			}
+			resp.nodes = append(resp.nodes, nn)
+			if s.onNodeSeen != nil {
+				s.onNodeSeen(nn.addr, nid)
+			}
 		}
 	}
 	// nodes6 (BEP 32): concatenated 38-byte compact IPv6 nodes. Parsed
@@ -692,10 +736,14 @@ func (s *server) dispatch(data []byte, src *net.UDPAddr) {
 			if port == 0 {
 				continue
 			}
-			resp.nodes = append(resp.nodes, node{
+			nn := node{
 				id:   nid,
 				addr: &net.UDPAddr{IP: ip, Port: int(port)},
-			})
+			}
+			resp.nodes = append(resp.nodes, nn)
+			if s.onNodeSeen != nil {
+				s.onNodeSeen(nn.addr, nid)
+			}
 		}
 	}
 	// BEP 33 bloom-filter fields. Present iff the responder implements it.
@@ -734,6 +782,45 @@ func (s *server) deliver(txid uint32, r response) {
 	select {
 	case ch <- r:
 	default:
+	}
+}
+
+// findNode issues a KRPC find_node query to addr. Find_node is the cheapest
+// DHT primitive — implemented by every BT client (bootstraps included) —
+// and returns only a compact "nodes" list closer to target. Used by the
+// BEP 51 crawler to warm-start: a BFS from bootstraps via find_node lands
+// us in the real BT-client graph within a couple of rounds, and every
+// responder flows into our shared NodePool via the onNodeSeen hook.
+func (s *server) findNode(ctx context.Context, addr *net.UDPAddr, target NodeID, timeout time.Duration) (response, error) {
+	s.mu.Lock()
+	s.txSeq++
+	txid := s.txSeq
+	ch := make(chan response, 1)
+	s.pending[txid] = ch
+	selfID := s.selfID
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.pending, txid)
+		s.mu.Unlock()
+	}()
+
+	var txB [4]byte
+	binary.BigEndian.PutUint32(txB[:], txid)
+	msg := encodeFindNode(txB, selfID, target)
+	if _, err := s.conn.WriteToUDP(msg, addr); err != nil {
+		return response{}, err
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r, nil
+	case <-timer.C:
+		return response{}, errors.New("find_node timeout")
+	case <-ctx.Done():
+		return response{}, ctx.Err()
 	}
 }
 
@@ -807,6 +894,24 @@ func (s *server) getPeers(ctx context.Context, addr *net.UDPAddr, target NodeID,
 	case <-ctx.Done():
 		return response{}, ctx.Err()
 	}
+}
+
+// encodeFindNode serializes a KRPC find_node query.
+//
+//	d1:ad2:id20:<self_id>6:target20:<target>4:wantl2:n42:n6ee1:q9:find_node1:t4:<tx>1:y1:qe
+//
+// The BEP 32 `want` list mirrors our get_peers encoding so dual-stack
+// responders hand back both IPv4 and IPv6 closer-nodes.
+func encodeFindNode(txid [4]byte, selfID NodeID, target NodeID) []byte {
+	buf := make([]byte, 0, 96)
+	buf = append(buf, "d1:ad2:id20:"...)
+	buf = append(buf, selfID[:]...)
+	buf = append(buf, "6:target20:"...)
+	buf = append(buf, target[:]...)
+	buf = append(buf, "4:wantl2:n42:n6ee1:q9:find_node1:t4:"...)
+	buf = append(buf, txid[:]...)
+	buf = append(buf, "1:y1:qe"...)
+	return buf
 }
 
 // encodeSampleInfoHashes serializes a BEP 51 sample_infohashes query. Keys
