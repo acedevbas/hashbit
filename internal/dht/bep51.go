@@ -198,13 +198,14 @@ func (c *BEP51Crawler) warmupFindNode(ctx context.Context, want int) {
 
 	type task struct{ addr *net.UDPAddr }
 	var (
-		mu       sync.Mutex
-		visited  = make(map[string]bool)
-		frontier []*net.UDPAddr
+		mu         sync.Mutex
+		seeded     = make(map[string]bool)
+		dispatched int
+		frontier   []*net.UDPAddr
 	)
 
 	for _, a := range bootstraps {
-		visited[a.String()] = true
+		seeded[a.String()] = true
 		frontier = append(frontier, a)
 	}
 
@@ -227,10 +228,10 @@ func (c *BEP51Crawler) warmupFindNode(ctx context.Context, want int) {
 						continue
 					}
 					key := nn.String()
-					if visited[key] {
+					if seeded[key] {
 						continue
 					}
-					visited[key] = true
+					seeded[key] = true
 					// Every FindNode reply also flows through the
 					// server's onNodeSeen hook (via KRPC dispatch), so
 					// the pool picks up this node for us. We still
@@ -249,7 +250,7 @@ func (c *BEP51Crawler) warmupFindNode(ctx context.Context, want int) {
 				return
 			}
 			mu.Lock()
-			if len(visited) >= want {
+			if dispatched >= want {
 				mu.Unlock()
 				return
 			}
@@ -270,6 +271,7 @@ func (c *BEP51Crawler) warmupFindNode(ctx context.Context, want int) {
 			}
 			n := frontier[0]
 			frontier = frontier[1:]
+			dispatched++
 			mu.Unlock()
 			select {
 			case jobs <- task{n}:
@@ -289,10 +291,11 @@ func (c *BEP51Crawler) warmupFindNode(ctx context.Context, want int) {
 func (c *BEP51Crawler) sampleFromPool(ctx context.Context) (map[[IDLen]byte]string, int, int) {
 	samples := make(map[[IDLen]byte]string)
 	var (
-		mu        sync.Mutex
-		visited   = make(map[string]bool)
-		frontier  []*net.UDPAddr
-		responses int
+		mu         sync.Mutex
+		seeded     = make(map[string]bool) // dedup on enqueue
+		dispatched int                     // counts jobs actually sent to workers
+		frontier   []*net.UDPAddr
+		responses  int
 	)
 
 	// Initial frontier from the shared pool. Doubled so the BFS has some
@@ -301,10 +304,10 @@ func (c *BEP51Crawler) sampleFromPool(ctx context.Context) (map[[IDLen]byte]stri
 	seeds := c.pool.Sample(c.opts.MaxNodes*2, true)
 	for _, a := range seeds {
 		key := a.String()
-		if visited[key] {
+		if seeded[key] {
 			continue
 		}
-		visited[key] = true
+		seeded[key] = true
 		frontier = append(frontier, a)
 	}
 	if len(frontier) == 0 {
@@ -356,10 +359,10 @@ func (c *BEP51Crawler) sampleFromPool(ctx context.Context) (map[[IDLen]byte]stri
 						continue
 					}
 					key := nn.addr.String()
-					if visited[key] {
+					if seeded[key] {
 						continue
 					}
-					visited[key] = true
+					seeded[key] = true
 					frontier = append(frontier, nn.addr)
 				}
 				mu.Unlock()
@@ -374,7 +377,7 @@ func (c *BEP51Crawler) sampleFromPool(ctx context.Context) (map[[IDLen]byte]stri
 				return
 			}
 			mu.Lock()
-			if len(visited) >= c.opts.MaxNodes {
+			if dispatched >= c.opts.MaxNodes {
 				mu.Unlock()
 				return
 			}
@@ -393,6 +396,7 @@ func (c *BEP51Crawler) sampleFromPool(ctx context.Context) (map[[IDLen]byte]stri
 			}
 			n := frontier[0]
 			frontier = frontier[1:]
+			dispatched++
 			mu.Unlock()
 			select {
 			case jobs <- task{n}:
@@ -403,5 +407,5 @@ func (c *BEP51Crawler) sampleFromPool(ctx context.Context) (map[[IDLen]byte]stri
 	}()
 
 	wg.Wait()
-	return samples, len(visited), responses
+	return samples, dispatched, responses
 }
