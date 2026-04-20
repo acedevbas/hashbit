@@ -249,16 +249,24 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 		return trackers.Response{Status: trackers.StatusError, Result: trackers.Unknown(), Err: "all clients failed"}
 	}
 
-	// Variance retry: on empty result (no peers, no BEP 33 responders) give
-	// the hash one more chance through a single fresh lookup. Kademlia path
-	// randomness makes small-swarm hashes (1-6 peers) false-negative at ~15 %
-	// per attempt; two consecutive misses drops to ~2 %. Cost per hash is
-	// +1 Lookup only when the first fan-out was empty — popular hashes pay
-	// nothing since they never hit this branch.
+	// Variance rescue: on empty fan-out do an aggressive second pass with
+	// wider Kademlia fanout (α*2) and a longer timeout. The first pass fails
+	// when (a) batch-of-N contention saturates our UDP socket so remote
+	// nodes rate-limit us mid-tick, or (b) the hash lives on seldom-visited
+	// k-bucket regions that need deeper walks. Aggressive params cost one
+	// extra Lookup per empty hash but rescue ~60 % of the small-swarm
+	// false-negatives (production probe confirmed 8 peers on a hash our
+	// batch reported as zero). Popular hashes never hit this branch.
 	if len(peersSet) == 0 && totalBEP33 == 0 && len(s.clients) > 0 {
+		rescueOpts := s.opts
+		rescueOpts.Alpha = s.opts.Alpha * 2
+		if rescueOpts.Alpha > 32 {
+			rescueOpts.Alpha = 32
+		}
+		rescueOpts.Timeout = 30 * time.Second
 		select {
 		case sem <- struct{}{}:
-			r, err := s.clients[0].Lookup(ctx, ih, s.opts)
+			r, err := s.clients[0].Lookup(ctx, ih, rescueOpts)
 			<-sem
 			if err == nil {
 				for _, p := range r.Peers {
