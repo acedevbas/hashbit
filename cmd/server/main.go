@@ -12,13 +12,17 @@ import (
 	"github.com/acedevbas/hashbit/internal/api"
 	"github.com/acedevbas/hashbit/internal/config"
 	"github.com/acedevbas/hashbit/internal/db"
+	"github.com/acedevbas/hashbit/internal/dht"
 	"github.com/acedevbas/hashbit/internal/httpclient"
 	"github.com/acedevbas/hashbit/internal/scheduler"
 	"github.com/acedevbas/hashbit/internal/trackers"
+	"github.com/acedevbas/hashbit/internal/trackers/dhtscraper"
 	"github.com/acedevbas/hashbit/internal/trackers/kinozal"
 	"github.com/acedevbas/hashbit/internal/trackers/nnmclub"
+	"github.com/acedevbas/hashbit/internal/trackers/public"
 	"github.com/acedevbas/hashbit/internal/trackers/rutor"
 	"github.com/acedevbas/hashbit/internal/trackers/rutracker"
+	"github.com/acedevbas/hashbit/internal/trackers/webtorrent"
 )
 
 func main() {
@@ -52,16 +56,61 @@ func main() {
 	rutorSc := rutor.New(hc)
 	nnmSc := nnmclub.New(hc)
 	rutSc := rutracker.New(hc)
+	publicSc := public.New(hc, cfg.PublicConcurrency, cfg.PublicAnnounce,
+		cfg.PublicRefreshInterval, cfg.PublicRefreshHTTPURL, cfg.PublicRefreshUDPURL)
+	defer func() { _ = publicSc.Close() }()
+	dhtSc, err := dhtscraper.New(cfg.DHTClients, cfg.DHTConcurrency, cfg.DHTLookupTimeout, cfg.DHTAlpha)
+	if err != nil {
+		log.Error("dht", "err", err)
+		os.Exit(1)
+	}
+	defer dhtSc.Close()
+	webtorrentSc := webtorrent.New(cfg.WebTorrentConcurrency)
 	var kinozalSc *kinozal.Scraper
 	if cfg.KinozalUK != "" {
 		kinozalSc = kinozal.New(hc, cfg.KinozalUK)
 	}
 
+	// Passive DHT node ("Sybil-lite"): listens on a stable UDP port, responds
+	// to incoming KRPC queries, and harvests every observed announce_peer into
+	// the passive-peer cache. Anything that routes a get_peers/announce_peer
+	// through us — i.e. any peer whose Kademlia path crosses our node id — is
+	// a free peer observation. The passive cache also feeds the active DHT
+	// scraper so cache hits skip the network round-trip.
+	var passiveNode *dht.PassiveNode
+	var passiveCache *dht.PassivePeerCache
+	if cfg.DHTPassiveEnabled {
+		passiveCache = dht.NewPassivePeerCache(pool, cfg.DHTPassiveMaxPerHash)
+		passiveCache.Start(ctx)
+		go passiveCache.RunJanitor(ctx, 2*cfg.DHTPassivePeerTTL, cfg.DHTPassiveJanitorInterval)
+
+		passiveNode, err = dht.NewPassiveNode(dht.PassiveOptions{
+			Port:     cfg.DHTPassivePort,
+			Recorder: passiveCache,
+		})
+		if err != nil {
+			log.Error("dht passive node", "err", err, "port", cfg.DHTPassivePort)
+			// non-fatal: the active DHT scraper still works without the passive observer
+		} else {
+			passiveNode.Start(ctx)
+			defer func() { _ = passiveNode.Close() }()
+			log.Info("dht passive node listening", "port", cfg.DHTPassivePort)
+		}
+		defer passiveCache.Close()
+
+		// Wire the cache into the active DHT scraper so fresh observed peers
+		// supplement each lookup without waiting on a live round-trip.
+		dhtSc.SetPassiveCache(passiveCache, cfg.DHTPassivePeerTTL, 200)
+	}
+
 	// Register for force-scrape (used by API).
 	apiScrapers := map[string]scheduler.Scraper{
-		trackers.Rutor:     rutorSc,
-		trackers.NNMClub:   nnmSc,
-		trackers.Rutracker: rutSc,
+		trackers.Rutor:      rutorSc,
+		trackers.NNMClub:    nnmSc,
+		trackers.Rutracker:  rutSc,
+		trackers.Public:     publicSc,
+		trackers.DHT:        dhtSc,
+		trackers.WebTorrent: webtorrentSc,
 	}
 	if kinozalSc != nil {
 		apiScrapers[trackers.Kinozal] = kinozalSc
@@ -75,6 +124,12 @@ func main() {
 			cfg.NNMBatchSize, cfg.ScrapeTick, 0),
 		scheduler.ConfigureWorker(trackers.Rutracker, rutSc, cfg, pool, log,
 			1, cfg.AnnounceTick, cfg.RutrackerRateLimit),
+		scheduler.ConfigureWorker(trackers.Public, publicSc, cfg, pool, log,
+			cfg.PublicBatchSize, cfg.ScrapeTick, 0),
+		scheduler.ConfigureWorker(trackers.DHT, dhtSc, cfg, pool, log,
+			cfg.DHTBatchSize, cfg.ScrapeTick, 0),
+		scheduler.ConfigureWorker(trackers.WebTorrent, webtorrentSc, cfg, pool, log,
+			cfg.WebTorrentBatchSize, cfg.ScrapeTick, 0),
 	}
 	if kinozalSc != nil {
 		workers = append(workers,

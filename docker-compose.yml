@@ -45,8 +45,45 @@ services:
       KINOZAL_UK: ${KINOZAL_UK:-}
 
       # ---- Batch sizes (scrape workers) ----
-      RUTOR_BATCH_SIZE: "300"
-      NNM_BATCH_SIZE:   "300"
+      RUTOR_BATCH_SIZE:  "300"
+      NNM_BATCH_SIZE:    "300"
+      PUBLIC_BATCH_SIZE: "500"
+
+      # Max concurrent endpoint flows inside one public scrape pass
+      # (~90 endpoints total — 32 keeps connections reasonable on a 1-2 vCPU box).
+      PUBLIC_CONCURRENCY: "32"
+
+      # Also run BEP 15 UDP announce + BEP 3 HTTP announce alongside scrape.
+      # Announce returns peer lists (≤200 peers per reply) and authoritative
+      # counts — heavier, but dramatically increases peer discovery for heavy
+      # hashes. Enables BOTH UDP and HTTP announce layers. "0" to disable.
+      PUBLIC_ANNOUNCE:    "1"
+
+      # Auto-refresh of public tracker endpoint lists from ngosang/trackerslist.
+      # Default 6h keeps the list fresh without hammering GitHub. Set to "0"
+      # to disable external fetches and rely only on the bundled defaults.
+      PUBLIC_REFRESH_INTERVAL: "6h"
+      # Upstream URLs. Override to pin a fork or a self-hosted mirror.
+      PUBLIC_REFRESH_URL_HTTP: "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_http.txt"
+      PUBLIC_REFRESH_URL_UDP:  "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_udp.txt"
+
+      # ---- DHT scraper (Mainline DHT get_peers + BEP 32 IPv6 + BEP 33 bloom-filter) ----
+      DHT_BATCH_SIZE:     "100"   # hashes per tick
+      DHT_CLIENTS:        "4"     # pool size: N independent sockets/node-ids querying in parallel
+      DHT_CONCURRENCY:    "64"    # total concurrent ops across the pool
+      DHT_ALPHA:          "8"     # Kademlia α parallelism per lookup
+      DHT_LOOKUP_TIMEOUT: "12s"   # budget per (hash, client)
+
+      # ---- Passive DHT node ("Sybil-lite") ----
+      # Listens on a STABLE UDP port and answers incoming KRPC queries. Every
+      # announce_peer that routes through us is persisted, which over time
+      # yields a running snapshot of the public swarm. Requires the UDP port
+      # below to be publicly reachable (see `ports:` section).
+      DHT_PASSIVE_ENABLED:          "1"
+      DHT_PASSIVE_PORT:             "6881"
+      DHT_PASSIVE_PEER_TTL:         "30m"   # how long a cached peer counts as "fresh"
+      DHT_PASSIVE_JANITOR_INTERVAL: "1h"    # janitor wake-up for stale-row deletion
+      DHT_PASSIVE_MAX_PER_HASH:     "500"   # cap per-hash writes to bound table growth
 
       # ---- Rate limits per worker (requests/sec) ----
       KINOZAL_RPS:    "5"
@@ -67,6 +104,11 @@ services:
       ON_DEMAND_TIMEOUT: "10s"
     ports:
       - "8080:8080"
+      # CRITICAL: the passive DHT node only works if remote peers can send us
+      # UDP datagrams. Without this mapping (or an equivalent firewall rule)
+      # we will never be added to anyone's routing table and announce_peer
+      # observations will stay at zero. Match DHT_PASSIVE_PORT above.
+      - "6881:6881/udp"
 
 volumes:
   pgdata:

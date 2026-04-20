@@ -289,14 +289,18 @@ func (s *Server) queryHashes(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		resp = append(resp, map[string]any{
-			"infohash":       st.Infohash,
-			"known":          true,
-			"source_tracker": st.SourceTracker,
-			"seeders":        st.Seeders,
-			"leechers":       st.Leechers,
-			"peer_count":     st.PeerCount,
-			"last_update_at": st.LastUpdateAt,
-			"added_at":       st.AddedAt,
+			"infohash":        st.Infohash,
+			"known":           true,
+			"source_tracker":  st.SourceTracker,
+			"seeders":         st.Seeders,
+			"leechers":        st.Leechers,
+			"peer_count":      st.PeerCount,
+			"last_update_at":  st.LastUpdateAt,
+			"added_at":        st.AddedAt,
+			"peak_seeders":    st.PeakSeeders,
+			"peak_leechers":   st.PeakLeechers,
+			"peak_peer_count": st.PeakPeerCount,
+			"last_nonzero_at": st.LastNonzeroAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": resp})
@@ -343,14 +347,18 @@ func (s *Server) getHash(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"infohash":       stats.Infohash,
-		"source_tracker": stats.SourceTracker,
-		"seeders":        stats.Seeders,
-		"leechers":       stats.Leechers,
-		"peer_count":     stats.PeerCount,
-		"last_update_at": stats.LastUpdateAt,
-		"added_at":       stats.AddedAt,
-		"per_tracker":    per,
+		"infohash":        stats.Infohash,
+		"source_tracker":  stats.SourceTracker,
+		"seeders":         stats.Seeders,
+		"leechers":        stats.Leechers,
+		"peer_count":      stats.PeerCount,
+		"last_update_at":  stats.LastUpdateAt,
+		"added_at":        stats.AddedAt,
+		"peak_seeders":    stats.PeakSeeders,
+		"peak_leechers":   stats.PeakLeechers,
+		"peak_peer_count": stats.PeakPeerCount,
+		"last_nonzero_at": stats.LastNonzeroAt,
+		"per_tracker":     per,
 	})
 }
 

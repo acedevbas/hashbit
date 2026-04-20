@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/acedevbas/hashbit/internal/trackers"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/acedevbas/hashbit/internal/trackers"
 )
 
 const schemaSQL = `
@@ -27,6 +27,18 @@ CREATE INDEX IF NOT EXISTS idx_infohashes_next_scrape ON infohashes (next_scrape
 CREATE INDEX IF NOT EXISTS idx_infohashes_source ON infohashes (source_tracker);
 CREATE INDEX IF NOT EXISTS idx_infohashes_seeders ON infohashes (seeders);
 
+-- Temporal accumulation: current seeders/leechers/peer_count reflect the
+-- instantaneous MAX across trackers and decay when peers go offline.
+-- Peaks preserve the historical high-water mark so swarm health signal
+-- survives churn. last_nonzero_at captures the most recent moment we
+-- observed a live swarm, which is a stronger liveness signal than
+-- last_update_at (which ticks on every scrape, even zero ones).
+-- Idempotent: ADD COLUMN IF NOT EXISTS works for both fresh installs and upgrades.
+ALTER TABLE infohashes ADD COLUMN IF NOT EXISTS peak_seeders INTEGER;
+ALTER TABLE infohashes ADD COLUMN IF NOT EXISTS peak_leechers INTEGER;
+ALTER TABLE infohashes ADD COLUMN IF NOT EXISTS peak_peer_count INTEGER;
+ALTER TABLE infohashes ADD COLUMN IF NOT EXISTS last_nonzero_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS tracker_state (
     infohash                  CHAR(40) NOT NULL REFERENCES infohashes(infohash) ON DELETE CASCADE,
     tracker                   TEXT NOT NULL,
@@ -43,6 +55,56 @@ CREATE TABLE IF NOT EXISTS tracker_state (
 );
 CREATE INDEX IF NOT EXISTS idx_tracker_state_next ON tracker_state (tracker, next_scrape_at);
 CREATE INDEX IF NOT EXISTS idx_tracker_state_infohash ON tracker_state (infohash);
+
+-- Backfill tracker_state rows for the 'public' aggregator so existing installs
+-- start scheduling public-scrape for hashes added before this tracker existed.
+-- NOT EXISTS form is cheaper than INSERT ... ON CONFLICT DO NOTHING on wide tables.
+INSERT INTO tracker_state (infohash, tracker, status)
+SELECT i.infohash, 'public', 'pending'
+FROM infohashes i
+WHERE NOT EXISTS (
+    SELECT 1 FROM tracker_state ts
+    WHERE ts.infohash = i.infohash AND ts.tracker = 'public'
+);
+
+-- Same backfill for the DHT BEP 33 scraper.
+INSERT INTO tracker_state (infohash, tracker, status)
+SELECT i.infohash, 'dht', 'pending'
+FROM infohashes i
+WHERE NOT EXISTS (
+    SELECT 1 FROM tracker_state ts
+    WHERE ts.infohash = i.infohash AND ts.tracker = 'dht'
+);
+
+-- Same backfill for the WebTorrent WSS scraper.
+INSERT INTO tracker_state (infohash, tracker, status)
+SELECT i.infohash, 'webtorrent', 'pending'
+FROM infohashes i
+WHERE NOT EXISTS (
+    SELECT 1 FROM tracker_state ts
+    WHERE ts.infohash = i.infohash AND ts.tracker = 'webtorrent'
+);
+
+-- Passive DHT cache: (infohash, peer) pairs harvested from incoming
+-- announce_peer KRPC queries. This is append-heavy and time-windowed — the
+-- janitor deletes rows older than 2*PassivePeerTTL, keeping the table bounded
+-- regardless of swarm churn. PK collapses duplicate observations; last_seen
+-- bumps on every re-observation so "recent" queries are cheap.
+CREATE TABLE IF NOT EXISTS dht_passive_peers (
+    infohash   CHAR(40) NOT NULL,
+    peer       TEXT NOT NULL,
+    last_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (infohash, peer)
+);
+-- Primary read path: "recent peers for this infohash". The DESC order on
+-- last_seen matches the query in FreshPassivePeers so it's served straight
+-- from the index without an extra sort.
+CREATE INDEX IF NOT EXISTS idx_dht_passive_recent
+    ON dht_passive_peers (infohash, last_seen DESC);
+-- Janitor sweep index: deletion by age crosses all hashes, so a
+-- last_seen-only index is materially faster than the composite above.
+CREATE INDEX IF NOT EXISTS idx_dht_passive_last_seen
+    ON dht_passive_peers (last_seen);
 `
 
 // New opens a pgx pool, waits for the DB to become available, and runs migrations.
@@ -235,12 +297,23 @@ func WriteTrackerResults(
 	}
 	aggBatch := &pgx.Batch{}
 	for h := range seen {
+		// Peaks use GREATEST(existing, incoming) with COALESCE so the first
+		// non-NULL observation seeds the peak. last_nonzero_at is only bumped
+		// when the swarm is currently alive, giving callers a reliable
+		// "was seen alive at …" timestamp independent of scrape cadence.
 		aggBatch.Queue(`
             UPDATE infohashes SET
                 seeders    = agg.seeders,
                 leechers   = agg.leechers,
                 peer_count = agg.peers,
-                last_update_at = NOW()
+                peak_seeders    = GREATEST(COALESCE(peak_seeders, 0),    COALESCE(agg.seeders, 0)),
+                peak_leechers   = GREATEST(COALESCE(peak_leechers, 0),   COALESCE(agg.leechers, 0)),
+                peak_peer_count = GREATEST(COALESCE(peak_peer_count, 0), COALESCE(agg.peers, 0)),
+                last_update_at  = NOW(),
+                last_nonzero_at = CASE
+                    WHEN COALESCE(agg.seeders, 0) > 0 OR COALESCE(agg.peers, 0) > 0 THEN NOW()
+                    ELSE last_nonzero_at
+                END
             FROM (
                 SELECT
                     MAX(seeders)    AS seeders,
@@ -282,6 +355,12 @@ type HashStats struct {
 	PeerCount     *int32
 	LastUpdateAt  *time.Time
 	AddedAt       time.Time
+	// Historical peaks — survive swarm churn so a torrent that was
+	// healthy last week is still recognizable today.
+	PeakSeeders   *int32
+	PeakLeechers  *int32
+	PeakPeerCount *int32
+	LastNonzeroAt *time.Time
 	PerTracker    []TrackerRow
 }
 
@@ -299,9 +378,11 @@ type TrackerRow struct {
 func GetStats(ctx context.Context, pool *pgxpool.Pool, hash string) (*HashStats, error) {
 	s := &HashStats{Infohash: hash}
 	err := pool.QueryRow(ctx, `
-        SELECT source_tracker, seeders, leechers, peer_count, last_update_at, added_at
+        SELECT source_tracker, seeders, leechers, peer_count, last_update_at, added_at,
+               peak_seeders, peak_leechers, peak_peer_count, last_nonzero_at
         FROM infohashes WHERE infohash = $1`, hash,
-	).Scan(&s.SourceTracker, &s.Seeders, &s.Leechers, &s.PeerCount, &s.LastUpdateAt, &s.AddedAt)
+	).Scan(&s.SourceTracker, &s.Seeders, &s.Leechers, &s.PeerCount, &s.LastUpdateAt, &s.AddedAt,
+		&s.PeakSeeders, &s.PeakLeechers, &s.PeakPeerCount, &s.LastNonzeroAt)
 	if err != nil {
 		return nil, err
 	}
@@ -327,7 +408,8 @@ func GetBulkStats(ctx context.Context, pool *pgxpool.Pool, hashes []string) (map
 		return nil, nil
 	}
 	rows, err := pool.Query(ctx, `
-        SELECT infohash, source_tracker, seeders, leechers, peer_count, last_update_at, added_at
+        SELECT infohash, source_tracker, seeders, leechers, peer_count, last_update_at, added_at,
+               peak_seeders, peak_leechers, peak_peer_count, last_nonzero_at
         FROM infohashes WHERE infohash = ANY($1)`, hashes)
 	if err != nil {
 		return nil, err
@@ -336,7 +418,8 @@ func GetBulkStats(ctx context.Context, pool *pgxpool.Pool, hashes []string) (map
 	result := make(map[string]*HashStats, len(hashes))
 	for rows.Next() {
 		s := &HashStats{}
-		if err := rows.Scan(&s.Infohash, &s.SourceTracker, &s.Seeders, &s.Leechers, &s.PeerCount, &s.LastUpdateAt, &s.AddedAt); err == nil {
+		if err := rows.Scan(&s.Infohash, &s.SourceTracker, &s.Seeders, &s.Leechers, &s.PeerCount, &s.LastUpdateAt, &s.AddedAt,
+			&s.PeakSeeders, &s.PeakLeechers, &s.PeakPeerCount, &s.LastNonzeroAt); err == nil {
 			result[s.Infohash] = s
 		}
 	}
@@ -379,4 +462,63 @@ func GetGlobalStats(ctx context.Context, pool *pgxpool.Pool) (*GlobalStats, erro
 		}
 	}
 	return s, nil
+}
+
+// --------- Passive DHT peer cache ---------
+
+// RecordPassivePeer UPSERTs one (infohash, peer) observation, bumping
+// last_seen to NOW() on conflict. Idempotent and cheap; the caller (the
+// passive DHT write-behind batcher) funnels many of these per second.
+func RecordPassivePeer(ctx context.Context, pool *pgxpool.Pool, infohash, peer string) error {
+	_, err := pool.Exec(ctx, `
+        INSERT INTO dht_passive_peers (infohash, peer)
+        VALUES ($1, $2)
+        ON CONFLICT (infohash, peer) DO UPDATE SET last_seen = NOW()`,
+		infohash, peer,
+	)
+	return err
+}
+
+// FreshPassivePeers returns peers observed within `within` for `infohash`,
+// newest first, capped at `limit`. Served from idx_dht_passive_recent without
+// an extra sort pass. Returns an empty slice for cold/unknown hashes.
+func FreshPassivePeers(ctx context.Context, pool *pgxpool.Pool, infohash string, within time.Duration, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	cutoff := time.Now().Add(-within)
+	rows, err := pool.Query(ctx, `
+        SELECT peer FROM dht_passive_peers
+        WHERE infohash = $1 AND last_seen >= $2
+        ORDER BY last_seen DESC
+        LIMIT $3`,
+		infohash, cutoff, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0, limit)
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return out, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// PassivePeersExpireOlderThan deletes observations older than `cutoff`.
+// Run periodically (the passive DHT janitor) to keep the table bounded.
+// Returns the number of rows deleted for logging/metrics.
+func PassivePeersExpireOlderThan(ctx context.Context, pool *pgxpool.Pool, cutoff time.Time) (int64, error) {
+	tag, err := pool.Exec(ctx, `
+        DELETE FROM dht_passive_peers WHERE last_seen < $1`,
+		cutoff,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

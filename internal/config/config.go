@@ -18,10 +18,29 @@ type Config struct {
 	APIToken string
 
 	// Per-tracker batch sizes and rate limits
-	RutorBatchSize     int
-	NNMBatchSize       int
-	KinozalRateLimit   int // req/sec
-	RutrackerRateLimit int // req/sec
+	RutorBatchSize    int
+	NNMBatchSize      int
+	PublicBatchSize   int
+	PublicConcurrency int  // max concurrent endpoint flows inside one public scrape
+	PublicAnnounce    bool // also do BEP 15 announce alongside scrape — more peers, slower tick
+
+	// Auto-refresh of public tracker endpoint lists from ngosang/trackerslist.
+	// Refresh is 0 = disabled (stick with bundled defaults); otherwise a
+	// background goroutine pulls updated lists every interval.
+	PublicRefreshInterval time.Duration
+	PublicRefreshHTTPURL  string
+	PublicRefreshUDPURL   string
+	DHTBatchSize          int
+	DHTConcurrency        int           // max concurrent ops across the whole DHT pool per tick
+	DHTLookupTimeout      time.Duration // budget for one hash on one client
+	DHTAlpha              int           // Kademlia parallelism factor
+	DHTClients            int           // DHT pool size (distinct node ids / sockets)
+	KinozalRateLimit      int           // req/sec
+	RutrackerRateLimit    int           // req/sec
+
+	// WebTorrent WSS scraper sizing.
+	WebTorrentBatchSize   int
+	WebTorrentConcurrency int
 
 	// Per-tracker tick intervals (how often the worker wakes up to process a chunk)
 	ScrapeTick     time.Duration
@@ -37,6 +56,16 @@ type Config struct {
 
 	// Kinozal passkey
 	KinozalUK string
+
+	// Passive DHT node ("Sybil-lite"): answers incoming KRPC queries on a
+	// stable UDP port and harvests observed announce_peer into a persistent
+	// cache. Running 24/7 gradually turns the cache into a snapshot of the
+	// public swarm for any hash popular enough to route through us.
+	DHTPassiveEnabled         bool
+	DHTPassivePort            int
+	DHTPassivePeerTTL         time.Duration
+	DHTPassiveJanitorInterval time.Duration
+	DHTPassiveMaxPerHash      int
 }
 
 func Load() (*Config, error) {
@@ -55,10 +84,48 @@ func Load() (*Config, error) {
 	if c.NNMBatchSize, err = atoi("NNM_BATCH_SIZE", "300"); err != nil {
 		return nil, err
 	}
+	if c.PublicBatchSize, err = atoi("PUBLIC_BATCH_SIZE", "500"); err != nil {
+		return nil, err
+	}
+	if c.PublicConcurrency, err = atoi("PUBLIC_CONCURRENCY", "32"); err != nil {
+		return nil, err
+	}
+	c.PublicAnnounce = strings.EqualFold(getenv("PUBLIC_ANNOUNCE", "1"), "1") ||
+		strings.EqualFold(getenv("PUBLIC_ANNOUNCE", "1"), "true")
+	// Default 6h refresh balances freshness vs upstream GitHub etiquette.
+	// Set to 0 to fully disable external fetches (e.g. air-gapped deploys).
+	if c.PublicRefreshInterval, err = dur("PUBLIC_REFRESH_INTERVAL", "6h"); err != nil {
+		return nil, err
+	}
+	c.PublicRefreshHTTPURL = getenv("PUBLIC_REFRESH_URL_HTTP",
+		"https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_http.txt")
+	c.PublicRefreshUDPURL = getenv("PUBLIC_REFRESH_URL_UDP",
+		"https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_udp.txt")
+	if c.DHTBatchSize, err = atoi("DHT_BATCH_SIZE", "100"); err != nil {
+		return nil, err
+	}
+	if c.DHTConcurrency, err = atoi("DHT_CONCURRENCY", "64"); err != nil {
+		return nil, err
+	}
+	if c.DHTAlpha, err = atoi("DHT_ALPHA", "8"); err != nil {
+		return nil, err
+	}
+	if c.DHTClients, err = atoi("DHT_CLIENTS", "4"); err != nil {
+		return nil, err
+	}
+	if c.DHTLookupTimeout, err = dur("DHT_LOOKUP_TIMEOUT", "12s"); err != nil {
+		return nil, err
+	}
 	if c.KinozalRateLimit, err = atoi("KINOZAL_RPS", "5"); err != nil {
 		return nil, err
 	}
 	if c.RutrackerRateLimit, err = atoi("RUTRACKER_RPS", "5"); err != nil {
+		return nil, err
+	}
+	if c.WebTorrentBatchSize, err = atoi("WEBTORRENT_BATCH_SIZE", "50"); err != nil {
+		return nil, err
+	}
+	if c.WebTorrentConcurrency, err = atoi("WEBTORRENT_CONCURRENCY", "8"); err != nil {
 		return nil, err
 	}
 
@@ -84,6 +151,23 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.OnDemandTimeout, err = dur("ON_DEMAND_TIMEOUT", "10s"); err != nil {
+		return nil, err
+	}
+
+	// Passive DHT node. Defaults: enabled, port 6881 (BitTorrent standard —
+	// peers remember our endpoint across restarts because it is stable).
+	c.DHTPassiveEnabled = strings.EqualFold(getenv("DHT_PASSIVE_ENABLED", "1"), "1") ||
+		strings.EqualFold(getenv("DHT_PASSIVE_ENABLED", "1"), "true")
+	if c.DHTPassivePort, err = atoi("DHT_PASSIVE_PORT", "6881"); err != nil {
+		return nil, err
+	}
+	if c.DHTPassivePeerTTL, err = dur("DHT_PASSIVE_PEER_TTL", "30m"); err != nil {
+		return nil, err
+	}
+	if c.DHTPassiveJanitorInterval, err = dur("DHT_PASSIVE_JANITOR_INTERVAL", "1h"); err != nil {
+		return nil, err
+	}
+	if c.DHTPassiveMaxPerHash, err = atoi("DHT_PASSIVE_MAX_PER_HASH", "500"); err != nil {
 		return nil, err
 	}
 

@@ -1,18 +1,20 @@
 # hashbit
 
 Сервис для массового опроса BitTorrent-трекеров по списку инфохешей.
-Параллельно поддерживает 4 трекера (Rutor, NNM-Club, Kinozal, Rutracker), умно планирует повторные опросы, отдаёт агрегированный max по сидам/пирам через REST API.
+Параллельно поддерживает 6 скрейперов (Rutor, NNM-Club, Kinozal, Rutracker, **public** — агрегатор публичных HTTP+UDP трекеров, **dht** — Mainline DHT + BEP 33 bloom-filter scrape), умно планирует повторные опросы, отдаёт агрегированный max по сидам/пирам через REST API.
 
 Стек: **Go 1.22 + PostgreSQL 16 + Docker Compose**. Запускается одной командой `docker compose up -d --build`.
 
 ## Что умеет
 
 - Принимает миллионы инфохешей через API (JSON или plain text)
-- 4 независимых воркера, каждый со своей стратегией:
+- 5 независимых воркеров, каждый со своей стратегией:
   - **Rutor** — batch HTTP scrape (300 хешей за запрос, anonymous)
   - **NNM-Club** — batch HTTP scrape (300 хешей за запрос, anonymous)
   - **Kinozal** — HTTP announce (1 хеш за запрос, с твоим passkey `uk=`)
   - **Rutracker** — HTTP announce + peer counting (без seeders/leechers split)
+  - **Public** — агрегатор 16 HTTP + ~50 UDP публичных трекеров (BEP 48 + BEP 15 multi-hash scrape). Лучший источник для хешей, которых нет на приватных трекерах.
+  - **DHT** — Mainline DHT `get_peers` с BEP 33 bloom-filter `scrape=1`. Один итеративный обход даёт (1) живые peer-адреса из DHT и (2) bloom-filter-оценку seed/peer count от 10-20% нод, реализующих BEP 33. Без NAT/TCP/μTP — чистый UDP DHT; ~12с на хеш, ~4 часа на 620k при параллельности 64.
 - Смарт-шедулер: живые торренты обновляем часто, мёртвые — редко (экспоненциальный backoff)
 - Bearer-аутентификация на всех API-ручках
 - Агрегат по всем трекерам: `max(seeders)` даёт лучшую известную оценку swarm'а
@@ -241,6 +243,13 @@ def is_alive(result):
 | `KINOZAL_UK` | — | Твой passkey с Kinozal; без него kinozal-воркер отключён |
 | `RUTOR_BATCH_SIZE` | 300 | Хешей за один batch-запрос на rutor |
 | `NNM_BATCH_SIZE` | 300 | То же для NNM-Club |
+| `PUBLIC_BATCH_SIZE` | 500 | Хешей за один public-scrape (раздаётся на ~66 трекеров параллельно) |
+| `PUBLIC_CONCURRENCY` | 32 | Макс. параллельных endpoint-запросов в одном public-проходе |
+| `DHT_BATCH_SIZE` | 100 | Хешей за один DHT-scrape тик |
+| `DHT_CLIENTS` | 4 | Размер пула DHT-клиентов (N разных node ID / сокетов, каждый по своему маршруту через Kademlia) |
+| `DHT_CONCURRENCY` | 64 | Всего параллельных операций во всём пуле |
+| `DHT_ALPHA` | 8 | Kademlia α (параллелизм внутри одного lookup) |
+| `DHT_LOOKUP_TIMEOUT` | 12s | Бюджет одного (hash, client) lookup'а |
 | `KINOZAL_RPS` | 5 | req/sec на kinozal |
 | `RUTRACKER_RPS` | 5 | req/sec на rutracker |
 | `SCRAPE_TICK` | 15s | Как часто просыпается scrape-воркер |

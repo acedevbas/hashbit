@@ -3,14 +3,17 @@ package trackers
 
 // Canonical tracker IDs used across the service.
 const (
-	Rutor     = "rutor"
-	NNMClub   = "nnm-club"
-	Kinozal   = "kinozal"
-	Rutracker = "rutracker"
+	Rutor      = "rutor"
+	NNMClub    = "nnm-club"
+	Kinozal    = "kinozal"
+	Rutracker  = "rutracker"
+	Public     = "public"     // aggregated scrape across many HTTP+UDP public trackers
+	DHT        = "dht"        // Mainline DHT get_peers + BEP 33 bloom-filter scrape
+	WebTorrent = "webtorrent" // WSS trackers serving the WebRTC/browser BT swarm
 )
 
 // All known tracker IDs (order matters for display).
-var All = []string{Rutor, NNMClub, Kinozal, Rutracker}
+var All = []string{Rutor, NNMClub, Kinozal, Rutracker, Public, DHT, WebTorrent}
 
 // ScrapeResult is a per-hash result from a single tracker query.
 // Some trackers (rutracker) can only report peer count, not seed/leech split;
