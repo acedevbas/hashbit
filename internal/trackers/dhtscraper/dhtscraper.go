@@ -259,11 +259,13 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 	// batch reported as zero). Popular hashes never hit this branch.
 	if len(peersSet) == 0 && totalBEP33 == 0 && len(s.clients) > 0 {
 		rescueOpts := s.opts
-		rescueOpts.Alpha = s.opts.Alpha * 2
-		if rescueOpts.Alpha > 32 {
-			rescueOpts.Alpha = 32
-		}
-		rescueOpts.Timeout = 30 * time.Second
+		// Pin rescue to max α=32 regardless of first-pass setting — production
+		// probes show α=32 finds ~3× more peers on small-swarm hashes than
+		// α=16 or less (27 vs 8-9 unique peers on a reference hash). Rescue
+		// is opt-in via empty-fan-out so the extra UDP traffic only hits on
+		// the hashes that demonstrably need a deeper walk.
+		rescueOpts.Alpha = 32
+		rescueOpts.Timeout = 60 * time.Second
 		select {
 		case sem <- struct{}{}:
 			r, err := s.clients[0].Lookup(ctx, ih, rescueOpts)
