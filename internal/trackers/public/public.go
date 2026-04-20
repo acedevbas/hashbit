@@ -48,6 +48,20 @@ type Scraper struct {
 	refreshUDPURL   string
 	stopRefresh     chan struct{}
 	closeOnce       sync.Once
+
+	// peerSink (optional) receives every (infohash, peer) pair extracted
+	// from a tracker announce reply. Wiring it up to the passive DHT peer
+	// cache turns ordinary public-tracker traffic into a massive free
+	// seeder for the cache — which downstream serves the DHT scraper's
+	// pre-check path and the /fingerprint API's peer-discovery phase.
+	peerSink PeerSink
+}
+
+// SetPeerSink injects an optional recorder for observed peer addresses.
+// Nil clears the hook. Safe to call once at startup before the first
+// Scrape; not designed for live swap under concurrent traffic.
+func (s *Scraper) SetPeerSink(sink PeerSink) {
+	s.peerSink = sink
 }
 
 // New builds a scraper with the default endpoint lists. concurrency caps how
@@ -161,11 +175,11 @@ func (s *Scraper) Scrape(ctx context.Context, hashes []string) map[string]tracke
 	if s.enableAnnounce {
 		go func() {
 			defer wg.Done()
-			announceUDP(ctx, udpURLs, hashes, result, &mu, sem)
+			announceUDP(ctx, udpURLs, hashes, result, &mu, sem, s.peerSink)
 		}()
 		go func() {
 			defer wg.Done()
-			announceHTTP(ctx, s.http, httpURLs, hashes, result, &mu, sem)
+			announceHTTP(ctx, s.http, httpURLs, hashes, result, &mu, sem, s.peerSink)
 		}()
 	}
 	wg.Wait()

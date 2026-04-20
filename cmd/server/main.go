@@ -102,6 +102,14 @@ func main() {
 		// Wire the cache into the active DHT scraper so fresh observed peers
 		// supplement each lookup without waiting on a live round-trip.
 		dhtSc.SetPassiveCache(passiveCache, cfg.DHTPassivePeerTTL, 200)
+
+		// Also wire the cache into the public-tracker scraper: every peer
+		// advertised by a tracker announce reply is a real BT client IP
+		// that would otherwise be discarded. Persisting them turns the
+		// passive cache from a DHT-only sink into a cross-tracker peer
+		// index — dramatically improves /fingerprint coverage and seeds
+		// the DHT pre-check path for hashes DHT alone can't find.
+		publicSc.SetPeerSink(passiveCache)
 	}
 
 	// Register for force-scrape (used by API).

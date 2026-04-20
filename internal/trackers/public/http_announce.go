@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -41,7 +42,7 @@ const (
 // every hash and merges per-hash results into `results` via max(). Matches the
 // shape of announceUDP — one goroutine per (endpoint, hash), sem-bounded.
 func announceHTTP(ctx context.Context, hc *httpclient.Client, endpoints []string, hashes []string,
-	results map[string]trackers.Response, mu *sync.Mutex, sem chan struct{}) {
+	results map[string]trackers.Response, mu *sync.Mutex, sem chan struct{}, sink PeerSink) {
 
 	if len(endpoints) == 0 || len(hashes) == 0 {
 		return
@@ -81,10 +82,15 @@ func announceHTTP(ctx context.Context, hc *httpclient.Client, endpoints []string
 					return
 				}
 				reqCtx, cancel := context.WithTimeout(ctx, httpAnnounceBudget)
-				partial, ok := announceHTTPOne(reqCtx, hc, endpoint, hexHash, raw)
+				partial, extractedPeers, ok := announceHTTPOne(reqCtx, hc, endpoint, hexHash, raw)
 				cancel()
 				if !ok {
 					health.Mark(endpoint)
+				}
+				if sink != nil && len(extractedPeers) > 0 {
+					for _, p := range extractedPeers {
+						sink.Record(hexHash, p)
+					}
 				}
 				if len(partial) == 0 {
 					return
@@ -113,19 +119,21 @@ func scrapeToAnnounceURL(scrapeURL string) string {
 // omitted — we re-announce the same hashes every scrape tick, and "started"
 // on each call would tip trackers off to rate-limit us.
 //
-// Returns (partial, ok). ok=false signals an endpoint-level failure and the
-// caller should mark the endpoint dead for the remainder of the Scrape;
-// nil partial with ok=true is just "tracker has no data on this hash".
-func announceHTTPOne(ctx context.Context, hc *httpclient.Client, announceURL, hexHash string, raw []byte) (map[string]trackers.Response, bool) {
+// Returns (partial, peers, ok). ok=false signals an endpoint-level failure
+// and the caller should mark the endpoint dead for the remainder of the
+// Scrape; nil partial with ok=true is just "tracker has no data on this
+// hash". `peers` is the decoded "ip:port" list extracted from the BEP 23
+// compact peer field, fed into the passive cache by the caller.
+func announceHTTPOne(ctx context.Context, hc *httpclient.Client, announceURL, hexHash string, raw []byte) (map[string]trackers.Response, []string, bool) {
 	out := make(map[string]trackers.Response)
 
 	peerID, err := generatePeerID()
 	if err != nil {
-		return out, true
+		return out, nil, true
 	}
 	key, err := generateHexKey(4)
 	if err != nil {
-		return out, true
+		return out, nil, true
 	}
 
 	// Build query string. url.Values would alphabetize keys; order doesn't matter
@@ -152,27 +160,27 @@ func announceHTTPOne(ctx context.Context, hc *httpclient.Client, announceURL, he
 
 	body, _, err := hc.Get(ctx, sb.String())
 	if err != nil {
-		return out, false
+		return out, nil, false
 	}
 	v, err := bencode.Decode(body)
 	if err != nil {
-		return out, false
+		return out, nil, false
 	}
 	top, ok := bencode.AsDict(v)
 	if !ok {
-		return out, false
+		return out, nil, false
 	}
 	if _, failed := bencode.DictString(top, "failure reason"); failed {
-		return out, true // tracker is alive but rejected this specific request
+		return out, nil, true // tracker is alive but rejected this specific request
 	}
 
 	seeds, _ := bencode.DictInt(top, "complete")
 	leech, _ := bencode.DictInt(top, "incomplete")
-	peerCount := countAnnouncePeers(top)
+	peerCount, extracted := extractAnnouncePeers(top)
 
 	// Empty swarm per tracker — skip so we don't clobber a mirror with real data.
 	if seeds == 0 && leech == 0 && peerCount == 0 {
-		return out, true
+		return out, extracted, true
 	}
 	out[hexHash] = trackers.Response{
 		Status: trackers.StatusOK,
@@ -183,27 +191,63 @@ func announceHTTPOne(ctx context.Context, hc *httpclient.Client, announceURL, he
 			PeerCount: peerCount,
 		},
 	}
-	return out, true
+	return out, extracted, true
 }
 
-// countAnnouncePeers returns the number of distinct peer entries found in the
-// "peers" (compact 6-byte or dict-list) and "peers6" (compact 18-byte) fields.
-// No cross-call deduplication — mergeInto takes max() across endpoints, which
-// is good enough signal for the scheduler.
-func countAnnouncePeers(top map[string]any) int32 {
-	var count int
+// extractAnnouncePeers parses BEP 23 (compact v4) / BEP 7 (compact v6) /
+// legacy dict-list peer fields and returns both the count and decoded
+// "ip:port" strings. Legacy dict-list entries produce addresses too when
+// they carry ip/port keys. Cross-call deduplication happens at the
+// passive cache layer.
+func extractAnnouncePeers(top map[string]any) (int32, []string) {
+	var out []string
 	if peers, ok := bencode.AsBytes(top["peers"]); ok {
 		// BEP 23 compact form: 4 bytes IPv4 + 2 bytes port per peer.
-		count += len(peers) / 6
+		for i := 0; i+6 <= len(peers); i += 6 {
+			if p := formatCompactPeer(peers[i : i+6]); p != "" {
+				out = append(out, p)
+			}
+		}
 	} else if peersList, ok := top["peers"].([]any); ok {
-		// Legacy dict form — each entry is {ip: "...", port: N}. Rare in 2025.
-		count += len(peersList)
+		// Legacy dict form — each entry is {ip: "...", port: N}. Rare in 2025
+		// but cheap to parse, and some bencoded trackers still emit this.
+		for _, e := range peersList {
+			m, ok := bencode.AsDict(e)
+			if !ok {
+				continue
+			}
+			ipStr, _ := bencode.DictString(m, "ip")
+			port, _ := bencode.DictInt(m, "port")
+			if ipStr == "" || port <= 0 || port >= 65536 {
+				continue
+			}
+			out = append(out, ipStr+":"+strconv.FormatInt(port, 10))
+		}
 	}
 	if peers6, ok := bencode.AsBytes(top["peers6"]); ok {
 		// BEP 7 compact IPv6: 16 bytes address + 2 bytes port per peer.
-		count += len(peers6) / 18
+		for i := 0; i+18 <= len(peers6); i += 18 {
+			if p := formatCompactPeer6(peers6[i : i+18]); p != "" {
+				out = append(out, p)
+			}
+		}
 	}
-	return clip32(int64(count))
+	return clip32(int64(len(out))), out
+}
+
+// formatCompactPeer6 decodes a BEP 7 compact IPv6 peer (16-byte addr +
+// 2-byte BE port) into a "[addr]:port" string. Returns empty on a zero
+// port (placeholder padding).
+func formatCompactPeer6(b []byte) string {
+	if len(b) != 18 {
+		return ""
+	}
+	port := int(b[16])<<8 | int(b[17])
+	if port == 0 {
+		return ""
+	}
+	ip := net.IP(append([]byte(nil), b[:16]...))
+	return "[" + ip.String() + "]:" + strconv.Itoa(port)
 }
 
 // generatePeerID produces a 20-byte peer_id using the Azureus "-UT3550-" prefix

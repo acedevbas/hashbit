@@ -61,7 +61,7 @@ const (
 // its requests fails — useful when a tracker is down and would otherwise
 // burn len(hashes) × per-request budget on dead air.
 func announceUDP(ctx context.Context, endpoints []string, hashes []string,
-	results map[string]trackers.Response, mu *sync.Mutex, sem chan struct{}) {
+	results map[string]trackers.Response, mu *sync.Mutex, sem chan struct{}, sink PeerSink) {
 
 	if len(endpoints) == 0 || len(hashes) == 0 {
 		return
@@ -99,10 +99,19 @@ func announceUDP(ctx context.Context, endpoints []string, hashes []string,
 					return
 				}
 				reqCtx, cancel := context.WithTimeout(ctx, udpAnnounceBudget)
-				partial, ok := announceUDPOne(reqCtx, endpoint, hex, raw)
+				partial, extractedPeers, ok := announceUDPOne(reqCtx, endpoint, hex, raw)
 				cancel()
 				if !ok {
 					health.Mark(endpoint)
+				}
+				// Funnel every observed peer into the passive-cache sink
+				// even when the partial map is empty (tracker returned
+				// peers but the counts were zero — rare, but still useful
+				// addresses). Non-blocking by contract of PeerSink.
+				if sink != nil && len(extractedPeers) > 0 {
+					for _, p := range extractedPeers {
+						sink.Record(hex, p)
+					}
 				}
 				if len(partial) == 0 {
 					return
@@ -116,12 +125,13 @@ func announceUDP(ctx context.Context, endpoints []string, hashes []string,
 	wg.Wait()
 }
 
-// announceUDPOne returns the partial result map and a bool indicating whether
-// the endpoint is healthy. ok=false signals the caller to mark the endpoint
-// dead for the remainder of the Scrape. A nil result with ok=true means the
-// tracker simply didn't know about this hash (empty swarm), not that it's
-// broken.
-func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte) (map[string]trackers.Response, bool) {
+// announceUDPOne returns the partial result map, the extracted peer list
+// (compact 6-byte entries decoded to "ip:port" strings), and a bool
+// indicating whether the endpoint is healthy. ok=false signals the caller
+// to mark the endpoint dead for the remainder of the Scrape. A nil result
+// with ok=true means the tracker simply didn't know about this hash
+// (empty swarm), not that it's broken.
+func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte) (map[string]trackers.Response, []string, bool) {
 	out := make(map[string]trackers.Response)
 
 	host := strings.TrimPrefix(endpoint, "udp://")
@@ -130,11 +140,11 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 	}
 	addr, err := net.ResolveUDPAddr("udp", host)
 	if err != nil {
-		return out, false
+		return out, nil, false
 	}
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		return out, false
+		return out, nil, false
 	}
 	defer conn.Close()
 	// Drive both Read/Write deadlines off the inner ctx so one stuck endpoint
@@ -145,12 +155,12 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 
 	connID, err := udpConnect(conn)
 	if err != nil {
-		return out, false
+		return out, nil, false
 	}
 
 	txid, err := randomUint32()
 	if err != nil {
-		return out, true
+		return out, nil, true
 	}
 
 	// BEP 15 announce request layout — 98 bytes total, no trailing extensions:
@@ -186,7 +196,7 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 
 	_ = conn.SetWriteDeadline(time.Now().Add(udpScrapeTimeout))
 	if _, err := conn.Write(req); err != nil {
-		return out, false
+		return out, nil, false
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(udpScrapeTimeout))
 
@@ -194,35 +204,42 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 	buf := make([]byte, 20+6*200+64)
 	n, err := conn.Read(buf)
 	if err != nil {
-		return out, false
+		return out, nil, false
 	}
 	if n < 20 {
-		return out, false
+		return out, nil, false
 	}
 	resp := buf[:n]
 	action := binary.BigEndian.Uint32(resp[0:4])
 	gotTxID := binary.BigEndian.Uint32(resp[4:8])
 	if gotTxID != txid {
-		return out, false
+		return out, nil, false
 	}
 	if action == udpActError {
-		return out, true // tracker is alive, just didn't like us — do not mark dead
+		return out, nil, true // tracker is alive, just didn't like us — do not mark dead
 	}
 	if action != udpActAnnounce {
-		return out, false
+		return out, nil, false
 	}
 	// interval at resp[8:12] — ignored; we're not rescheduling by tracker advice.
 	leechers := binary.BigEndian.Uint32(resp[12:16])
 	seeders := binary.BigEndian.Uint32(resp[16:20])
 
-	// Count peer entries (6 bytes each). Used as peer_count signal.
+	// Decode peer entries (6 bytes each). Used as peer_count signal AND as
+	// raw addresses that flow into the passive cache sink.
 	peers := resp[20:]
 	peerCount := int32(len(peers) / 6)
+	extracted := make([]string, 0, int(peerCount))
+	for i := 0; i+6 <= len(peers); i += 6 {
+		if p := formatCompactPeer(peers[i : i+6]); p != "" {
+			extracted = append(extracted, p)
+		}
+	}
 
 	// If swarm is empty by tracker account, treat as not-found to avoid
 	// wiping smarter sources' data. Otherwise record this tracker's view.
 	if seeders == 0 && leechers == 0 && peerCount == 0 {
-		return out, true
+		return out, extracted, true
 	}
 	out[hexHash] = trackers.Response{
 		Status: trackers.StatusOK,
@@ -233,19 +250,21 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 			PeerCount: peerCount,
 		},
 	}
-	return out, true
+	return out, extracted, true
 }
 
-// formatCompactPeer is unused directly today — the peer list is counted but
-// not further fanned out — retained here as a hook for future work that
-// might want to feed discovered peers back into btprobe / DHT fingerprint.
+// formatCompactPeer decodes a 6-byte BEP 23 compact peer record
+// (4-byte IPv4 + 2-byte BE port) into a dial-ready "ip:port" string.
+// Returns empty on a zero port — those are placeholders that some
+// trackers pad the end of an announce response with.
 func formatCompactPeer(b []byte) string {
 	if len(b) != 6 {
 		return ""
 	}
-	ip := net.IPv4(b[0], b[1], b[2], b[3])
 	port := binary.BigEndian.Uint16(b[4:6])
+	if port == 0 {
+		return ""
+	}
+	ip := net.IPv4(b[0], b[1], b[2], b[3])
 	return fmt.Sprintf("%s:%d", ip.To4(), port)
 }
-
-var _ = formatCompactPeer // avoid unused-symbol warnings in Go vet
