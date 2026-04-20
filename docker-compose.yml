@@ -47,17 +47,25 @@ services:
       # ---- Batch sizes (scrape workers) ----
       RUTOR_BATCH_SIZE:  "300"
       NNM_BATCH_SIZE:    "300"
-      PUBLIC_BATCH_SIZE: "500"
+      # Production default 300 (not 500): layer-3 UDP-announce + layer-4 HTTP-
+      # announce fan out single-hash per (tracker, hash). At batch=500 and
+      # ~100 endpoints that's 50k round-trips per tick which saturates the
+      # upstream rate-limits and hangs the worker under current concurrency.
+      PUBLIC_BATCH_SIZE: "300"
 
       # Max concurrent endpoint flows inside one public scrape pass
-      # (~90 endpoints total — 32 keeps connections reasonable on a 1-2 vCPU box).
-      PUBLIC_CONCURRENCY: "32"
+      # (~90 endpoints total — 64 is comfortable on a 2 vCPU box).
+      PUBLIC_CONCURRENCY: "64"
 
       # Also run BEP 15 UDP announce + BEP 3 HTTP announce alongside scrape.
       # Announce returns peer lists (≤200 peers per reply) and authoritative
       # counts — heavier, but dramatically increases peer discovery for heavy
-      # hashes. Enables BOTH UDP and HTTP announce layers. "0" to disable.
-      PUBLIC_ANNOUNCE:    "1"
+      # hashes. "1" enables BOTH UDP and HTTP announce layers; "0" keeps only
+      # scrape (scrape-only is fast but yields counts only, no peer list).
+      # DISABLED pending fix for the announce-layer hang on stuck goroutines
+      # (one dead tracker can block the whole Scrape() call); enable once
+      # per-request ctx timeouts are in place.
+      PUBLIC_ANNOUNCE:    "0"
 
       # Auto-refresh of public tracker endpoint lists from ngosang/trackerslist.
       # Default 6h keeps the list fresh without hammering GitHub. Set to "0"
