@@ -56,6 +56,15 @@ type Scraper struct {
 	concurrency int
 	opts        dht.Options
 
+	// rescue is a long-lived anacrolix/dht backed client used ONLY for the
+	// empty-fan-out rescue path. Its routing table warms up over time so
+	// subsequent rescues walk efficiently without a fresh bootstrap. We
+	// chose anacrolix for this path because our hand-rolled iterative
+	// lookup converges too fast on small-swarm hashes (convergence check
+	// fires after bootstrap burst when closest nodes don't return new
+	// neighbours); anacrolix's battle-tested traversal walks deeper.
+	rescue *dht.RescueClient
+
 	// passiveCache, if non-nil, is consulted BEFORE the active lookups. The
 	// cache supplements rather than replaces live queries: a passive hit
 	// confirms peer existence cheaply, but an active lookup may still
@@ -114,10 +123,18 @@ func New(numClients, concurrency int, lookupTimeout time.Duration, alpha int) (*
 		}
 		clients = append(clients, c)
 	}
+	rescue, err := dht.NewRescueClient()
+	if err != nil {
+		for _, c := range clients {
+			_ = c.Close()
+		}
+		return nil, err
+	}
 	return &Scraper{
 		clients:     clients,
 		concurrency: concurrency,
 		opts:        dht.Options{Timeout: lookupTimeout, Alpha: alpha},
+		rescue:      rescue,
 	}, nil
 }
 
@@ -125,6 +142,9 @@ func New(numClients, concurrency int, lookupTimeout time.Duration, alpha int) (*
 func (s *Scraper) Close() error {
 	for _, c := range s.clients {
 		_ = c.Close()
+	}
+	if s.rescue != nil {
+		_ = s.rescue.Close()
 	}
 	return nil
 }
@@ -264,30 +284,22 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 	// extra Lookup per empty hash but rescue ~60 % of the small-swarm
 	// false-negatives (production probe confirmed 8 peers on a hash our
 	// batch reported as zero). Popular hashes never hit this branch.
-	if len(peersSet) == 0 && totalBEP33 == 0 {
-		// Rescue on a FRESH one-shot Client — the shared pool's UDP sockets
-		// are simultaneously handling ~batch_size concurrent lookups and have
-		// burned through per-IP rate-limit budgets at remote DHT nodes; a
-		// rescue through the same socket inherits that throttling and keeps
-		// coming back empty even at α=32. Binding a new UDP port gives the
-		// lookup a clean rate-limit ledger at every node it walks, which in
-		// production testing rescues hashes the shared-socket rescue missed
-		// (standalone probe finds 27-31 peers on a reference hash our batch
-		// reports as zero). Cost: one socket allocation + one bootstrap walk
-		// per empty hash; only empty hashes pay.
-		rescueOpts := s.opts
-		rescueOpts.Alpha = 32
-		rescueOpts.Timeout = 60 * time.Second
+	if len(peersSet) == 0 && totalBEP33 == 0 && s.rescue != nil {
+		// Rescue via anacrolix/dht. Our hand-rolled iterative lookup
+		// converges too early on small-swarm hashes (bootstrap returns no
+		// closer neighbours → top-K already queried → break, only ~8 nodes
+		// visited). Anacrolix walks deeper and reliably finds 20-30 peers
+		// on hashes where ours reports zero. We keep anacrolix off the hot
+		// path for popular hashes because batch-parallel AnnounceTraversals
+		// don't cancel cleanly under time pressure, but as a rescue it's
+		// perfect: it's called only on the ~40-60 % of the batch that's
+		// demonstrably empty anyway, and its shared long-lived routing
+		// table warms up across ticks.
 		select {
 		case sem <- struct{}{}:
 			func() {
 				defer func() { <-sem }()
-				fresh, err := dht.NewClient()
-				if err != nil {
-					return
-				}
-				defer fresh.Close()
-				r, err := fresh.Lookup(ctx, ih, rescueOpts)
+				r, err := s.rescue.Lookup(ctx, ih, 30*time.Second)
 				if err != nil {
 					return
 				}
