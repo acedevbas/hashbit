@@ -67,17 +67,12 @@ services:
       PUBLIC_REFRESH_URL_HTTP: "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_http.txt"
       PUBLIC_REFRESH_URL_UDP:  "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_udp.txt"
 
-      # ---- DHT scraper (anacrolix/dht/v2: Mainline DHT + BEP 33 bloom-filter) ----
-      # Tuning notes after the swap from our hand-rolled iterative lookup:
-      # anacrolix maintains its own persistent routing table, so multiple
-      # clients no longer add Kademlia coverage — they just multiply UDP
-      # traffic and exhaust our source port rate-limit at remote nodes.
-      # Smaller batches + single client produces more stable tick times.
-      DHT_BATCH_SIZE:     "50"    # hashes per tick
-      DHT_CLIENTS:        "1"     # anacrolix has built-in routing table; more clients = self-DoS
-      DHT_CONCURRENCY:    "32"    # concurrent lookups in the batch
-      DHT_ALPHA:          "8"     # advisory only (anacrolix owns traversal fan-out)
-      DHT_LOOKUP_TIMEOUT: "30s"   # AnnounceTraversal default is 3min; we cap shorter
+      # ---- DHT scraper (Mainline DHT get_peers + BEP 32 IPv6 + BEP 33 bloom-filter) ----
+      DHT_BATCH_SIZE:     "100"   # hashes per tick
+      DHT_CLIENTS:        "4"     # pool size: N independent sockets/node-ids querying in parallel
+      DHT_CONCURRENCY:    "64"    # total concurrent ops across the pool
+      DHT_ALPHA:          "8"     # Kademlia α parallelism per lookup
+      DHT_LOOKUP_TIMEOUT: "12s"   # budget per (hash, client)
 
       # ---- Passive DHT node ("Sybil-lite") ----
       # Listens on a STABLE UDP port and answers incoming KRPC queries. Every
