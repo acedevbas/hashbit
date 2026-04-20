@@ -264,20 +264,33 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 	// extra Lookup per empty hash but rescue ~60 % of the small-swarm
 	// false-negatives (production probe confirmed 8 peers on a hash our
 	// batch reported as zero). Popular hashes never hit this branch.
-	if len(peersSet) == 0 && totalBEP33 == 0 && len(s.clients) > 0 {
+	if len(peersSet) == 0 && totalBEP33 == 0 {
+		// Rescue on a FRESH one-shot Client — the shared pool's UDP sockets
+		// are simultaneously handling ~batch_size concurrent lookups and have
+		// burned through per-IP rate-limit budgets at remote DHT nodes; a
+		// rescue through the same socket inherits that throttling and keeps
+		// coming back empty even at α=32. Binding a new UDP port gives the
+		// lookup a clean rate-limit ledger at every node it walks, which in
+		// production testing rescues hashes the shared-socket rescue missed
+		// (standalone probe finds 27-31 peers on a reference hash our batch
+		// reports as zero). Cost: one socket allocation + one bootstrap walk
+		// per empty hash; only empty hashes pay.
 		rescueOpts := s.opts
-		// Pin rescue to max α=32 regardless of first-pass setting — production
-		// probes show α=32 finds ~3× more peers on small-swarm hashes than
-		// α=16 or less (27 vs 8-9 unique peers on a reference hash). Rescue
-		// is opt-in via empty-fan-out so the extra UDP traffic only hits on
-		// the hashes that demonstrably need a deeper walk.
 		rescueOpts.Alpha = 32
 		rescueOpts.Timeout = 60 * time.Second
 		select {
 		case sem <- struct{}{}:
-			r, err := s.clients[0].Lookup(ctx, ih, rescueOpts)
-			<-sem
-			if err == nil {
+			func() {
+				defer func() { <-sem }()
+				fresh, err := dht.NewClient()
+				if err != nil {
+					return
+				}
+				defer fresh.Close()
+				r, err := fresh.Lookup(ctx, ih, rescueOpts)
+				if err != nil {
+					return
+				}
 				for _, p := range r.Peers {
 					peersSet[p] = struct{}{}
 				}
@@ -288,7 +301,7 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 						fusedPeers[j] |= r.MergedBFPeers[j]
 					}
 				}
-			}
+			}()
 		case <-ctx.Done():
 		}
 	}
