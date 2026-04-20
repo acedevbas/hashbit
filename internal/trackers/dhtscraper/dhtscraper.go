@@ -249,6 +249,33 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 		return trackers.Response{Status: trackers.StatusError, Result: trackers.Unknown(), Err: "all clients failed"}
 	}
 
+	// Variance retry: on empty result (no peers, no BEP 33 responders) give
+	// the hash one more chance through a single fresh lookup. Kademlia path
+	// randomness makes small-swarm hashes (1-6 peers) false-negative at ~15 %
+	// per attempt; two consecutive misses drops to ~2 %. Cost per hash is
+	// +1 Lookup only when the first fan-out was empty — popular hashes pay
+	// nothing since they never hit this branch.
+	if len(peersSet) == 0 && totalBEP33 == 0 && len(s.clients) > 0 {
+		select {
+		case sem <- struct{}{}:
+			r, err := s.clients[0].Lookup(ctx, ih, s.opts)
+			<-sem
+			if err == nil {
+				for _, p := range r.Peers {
+					peersSet[p] = struct{}{}
+				}
+				if r.BEP33Responders > 0 {
+					totalBEP33 += r.BEP33Responders
+					for j := 0; j < 256; j++ {
+						fusedSeeds[j] |= r.MergedBFSeeds[j]
+						fusedPeers[j] |= r.MergedBFPeers[j]
+					}
+				}
+			}
+		case <-ctx.Done():
+		}
+	}
+
 	resp := trackers.Response{Result: trackers.Unknown()}
 	switch {
 	case totalBEP33 > 0:
