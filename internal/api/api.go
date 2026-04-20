@@ -434,9 +434,25 @@ func (s *Server) fingerprint(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Gather peer candidates. We budget twice the requested N so PEX and
-	// per-peer dial failures still leave enough for a meaningful fingerprint.
-	peerCtx, cancelPeers := context.WithTimeout(r.Context(), 20*time.Second)
+	// Peer-discovery budget. For popular hashes the active DHT fan-out
+	// returns peers in under 2s, but small-swarm/edge-case hashes rely on
+	// anacrolix rescue (up to 15s) + writes into passive cache. 45s is
+	// generous enough to saturate the rescue path; caller can override
+	// via ?discovery=Xs within [5s, 60s].
+	discovery := 45 * time.Second
+	if d := r.URL.Query().Get("discovery"); d != "" {
+		if dv, err := time.ParseDuration(d); err == nil {
+			if dv < 5*time.Second {
+				dv = 5 * time.Second
+			}
+			if dv > 60*time.Second {
+				dv = 60 * time.Second
+			}
+			discovery = dv
+		}
+	}
+
+	peerCtx, cancelPeers := context.WithTimeout(r.Context(), discovery)
 	peers, err := s.Peers.PeersForHash(peerCtx, h)
 	cancelPeers()
 	if err != nil {
