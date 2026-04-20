@@ -1,0 +1,78 @@
+name: Build & Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {} # manual trigger for rollbacks / ad-hoc redeploys
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false # never cancel a half-deployed build
+
+jobs:
+  # Fail fast if the code doesn't build — no point shipping to prod otherwise.
+  build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Build server (pure Go, CGO_ENABLED=0)
+        run: CGO_ENABLED=0 go build -v -o /tmp/server ./cmd/server
+
+      - name: Vet
+        run: go vet ./cmd/server ./internal/...
+
+  deploy:
+    needs: build-check
+    runs-on: ubuntu-latest
+    steps:
+      # Server-side deploy: git pull + docker compose up -d --build.
+      # Rationale: we don't keep an image registry because the server IS the
+      # builder — saves a step and guarantees the running image matches the
+      # checked-out commit byte-for-byte. `docker compose up -d app` does
+      # NOT touch hashbit-db-1 (and by extension nginx upstream), so the
+      # only observable downtime is the ~15s container swap on port 9090.
+      # nginx stays up throughout and returns 502 for that window.
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script_stop: true
+          command_timeout: "10m"
+          script: |
+            set -euo pipefail
+            cd /root/hashbit
+
+            echo "--- fetch ---"
+            git fetch --all --prune
+            git checkout main
+            git reset --hard origin/main
+
+            echo "--- rebuild app (db stays up) ---"
+            docker compose up -d --build app
+
+            echo "--- wait for healthcheck (up to 90s) ---"
+            for i in $(seq 1 30); do
+              if curl -fsS --max-time 3 http://127.0.0.1:9090/health >/dev/null; then
+                echo "healthy at attempt $i"
+                break
+              fi
+              sleep 3
+            done
+
+            echo "--- verify via nginx (external path) ---"
+            curl -fsS --max-time 5 https://hashbit.twoheartsonecloud.ru/health
+
+            echo "--- prune dangling images to reclaim disk ---"
+            docker image prune -f >/dev/null 2>&1 || true
+
+            echo "=== deploy complete ==="
+            docker compose ps --format 'table {{.Name}}\t{{.Status}}'
