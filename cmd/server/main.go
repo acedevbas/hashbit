@@ -14,6 +14,7 @@ import (
 	"github.com/acedevbas/hashbit/internal/db"
 	"github.com/acedevbas/hashbit/internal/dht"
 	"github.com/acedevbas/hashbit/internal/httpclient"
+	"github.com/acedevbas/hashbit/internal/metrics"
 	"github.com/acedevbas/hashbit/internal/scheduler"
 	"github.com/acedevbas/hashbit/internal/trackers"
 	"github.com/acedevbas/hashbit/internal/trackers/dhtscraper"
@@ -59,7 +60,7 @@ func main() {
 	publicSc := public.New(hc, cfg.PublicConcurrency, cfg.PublicAnnounce,
 		cfg.PublicRefreshInterval, cfg.PublicRefreshHTTPURL, cfg.PublicRefreshUDPURL)
 	defer func() { _ = publicSc.Close() }()
-	dhtSc, err := dhtscraper.New(cfg.DHTClients, cfg.DHTConcurrency, cfg.DHTLookupTimeout, cfg.DHTAlpha)
+	dhtSc, err := dhtscraper.New(cfg.DHTClients, cfg.DHTClients6, cfg.DHTConcurrency, cfg.DHTLookupTimeout, cfg.DHTAlpha)
 	if err != nil {
 		log.Error("dht", "err", err)
 		os.Exit(1)
@@ -141,6 +142,33 @@ func main() {
 		go w.Run(ctx)
 	}
 
+	// Background sampler that refreshes DB-backed Prometheus gauges every 30s.
+	// Running this before the HTTP server starts means /metrics already has
+	// non-zero gauges by the time the first scrape hits us.
+	metrics.StartGaugeSampler(ctx, pool, log, 30*time.Second)
+
+	// BEP 51 sample_infohashes crawler. Opens its own Client (separate UDP
+	// socket) so discovery traffic does not starve the scrape pool.
+	// Discovered hashes land in the `discovered_hashes` table — the operator
+	// promotes them into `infohashes` on their own schedule.
+	var bep51Client *dht.Client
+	if cfg.DHTBEP51Enabled {
+		c, err := dht.NewClient()
+		if err != nil {
+			log.Error("bep51 client", "err", err)
+		} else {
+			bep51Client = c
+			defer func() { _ = bep51Client.Close() }()
+			crawler := dht.NewBEP51Crawler(bep51Client, pool, log, dht.BEP51CrawlerOptions{
+				Interval:     cfg.DHTBEP51Interval,
+				MaxNodes:     cfg.DHTBEP51MaxNodes,
+				Alpha:        cfg.DHTBEP51Alpha,
+				QueryTimeout: cfg.DHTBEP51QueryTimeout,
+			})
+			go crawler.Run(ctx)
+		}
+	}
+
 	// Start HTTP API.
 	srv := &api.Server{
 		Pool:            pool,
@@ -148,6 +176,7 @@ func main() {
 		APIToken:        cfg.APIToken,
 		Scrapers:        apiScrapers,
 		OnDemandTimeout: cfg.OnDemandTimeout,
+		Peers:           dhtSc,
 	}
 	httpSrv := &http.Server{
 		Addr:              cfg.HTTPAddr,

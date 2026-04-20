@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/acedevbas/hashbit/internal/bencode"
+	"github.com/acedevbas/hashbit/internal/metrics"
 )
 
 // PeerRecorder is the write-side of the passive cache. Implementations persist
@@ -198,6 +199,7 @@ func (n *PassiveNode) handlePacket(data []byte, src *net.UDPAddr) {
 		return
 	}
 	n.queriesRecv.Add(1)
+	metrics.IncPassiveQuery()
 	switch q {
 	case "ping":
 		n.replyPing(tx, src)
@@ -257,6 +259,7 @@ func (n *PassiveNode) handleAnnouncePeer(tx []byte, src *net.UDPAddr, args map[s
 	}
 
 	n.announcesRec.Add(1)
+	metrics.IncPassiveAnnounce()
 	// Always reply (echo our id); token check is advisory for observation.
 	n.writeResponse(tx, src, encodeIDOnlyResponse(tx, n.currentID()))
 

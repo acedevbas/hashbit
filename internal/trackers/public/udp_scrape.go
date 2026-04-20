@@ -41,6 +41,12 @@ const (
 
 	udpConnectTimeout = 3 * time.Second
 	udpScrapeTimeout  = 5 * time.Second
+
+	// Per-endpoint scrape budget — one UDP connect + up to (hashes/70) chunks.
+	// With 500 hashes that's 8 chunks × 5s read = up to 40s if a tracker is slow;
+	// the budget caps the tail at a reasonable value so one dawdling tracker
+	// cannot bleed into the next tick.
+	udpScrapeEndpointBudget = 10 * time.Second
 )
 
 // scrapeUDP fans out across UDP endpoints in parallel (capped by sem) and merges
@@ -80,7 +86,9 @@ func scrapeUDP(ctx context.Context, endpoints []string, hashes []string,
 			case <-ctx.Done():
 				return
 			}
-			partial := scrapeUDPOne(ctx, endpoint, hexHashes, raw)
+			reqCtx, cancel := context.WithTimeout(ctx, udpScrapeEndpointBudget)
+			partial := scrapeUDPOne(reqCtx, endpoint, hexHashes, raw)
+			cancel()
 			if len(partial) == 0 {
 				return
 			}

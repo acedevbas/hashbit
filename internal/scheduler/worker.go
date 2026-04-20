@@ -17,6 +17,7 @@ import (
 
 	"github.com/acedevbas/hashbit/internal/config"
 	"github.com/acedevbas/hashbit/internal/db"
+	"github.com/acedevbas/hashbit/internal/metrics"
 	"github.com/acedevbas/hashbit/internal/trackers"
 )
 
@@ -106,6 +107,7 @@ func (w *Worker) tick(ctx context.Context) {
 		w.Log.Error("write results", "tracker", w.Name, "err", err)
 		return
 	}
+	metrics.ObserveScrapeTick(w.Name, ok, notFound, errs, took)
 	w.Log.Info("tick done",
 		"tracker", w.Name,
 		"count", len(hashes),

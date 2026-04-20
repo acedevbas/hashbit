@@ -41,12 +41,25 @@ const (
 	udpEventNone   uint32 = 0
 	udpNumWant     int32  = 200
 	udpFakePort    uint16 = 6881
+
+	// Per-request budget for one UDP announce. Announce is single-hash, so this
+	// caps the tail cost of a slow endpoint per (hash, endpoint) pair. Was
+	// previously driven off the outer Scrape deadline, which meant one stuck
+	// endpoint × len(hashes) goroutines could hold concurrency slots for the
+	// entire outer budget and stall the whole fan-out.
+	udpAnnounceBudget = 4 * time.Second
 )
 
 // announceUDP runs BEP 15 announces in parallel across all UDP endpoints for
 // every hash, harvesting peer lists + authoritative seeders/leechers counts.
 // Merges into `results` via max(). Unlike scrape (multi-hash per request),
 // announce is single-hash, so this does len(hashes) * len(endpoints) roundtrips.
+//
+// Each (endpoint, hash) gets its own per-request context with a short timeout
+// so one stuck endpoint cannot stall the fan-out. An endpoint-level health
+// breaker additionally skips further hashes on an endpoint once any one of
+// its requests fails — useful when a tracker is down and would otherwise
+// burn len(hashes) × per-request budget on dead air.
 func announceUDP(ctx context.Context, endpoints []string, hashes []string,
 	results map[string]trackers.Response, mu *sync.Mutex, sem chan struct{}) {
 
@@ -69,6 +82,7 @@ func announceUDP(ctx context.Context, endpoints []string, hashes []string,
 		return
 	}
 
+	health := newEndpointHealth()
 	var wg sync.WaitGroup
 	for _, ep := range endpoints {
 		for h, raw := range rawByHash {
@@ -81,7 +95,15 @@ func announceUDP(ctx context.Context, endpoints []string, hashes []string,
 				case <-ctx.Done():
 					return
 				}
-				partial := announceUDPOne(ctx, endpoint, hex, raw)
+				if health.Bad(endpoint) {
+					return
+				}
+				reqCtx, cancel := context.WithTimeout(ctx, udpAnnounceBudget)
+				partial, ok := announceUDPOne(reqCtx, endpoint, hex, raw)
+				cancel()
+				if !ok {
+					health.Mark(endpoint)
+				}
 				if len(partial) == 0 {
 					return
 				}
@@ -94,7 +116,12 @@ func announceUDP(ctx context.Context, endpoints []string, hashes []string,
 	wg.Wait()
 }
 
-func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte) map[string]trackers.Response {
+// announceUDPOne returns the partial result map and a bool indicating whether
+// the endpoint is healthy. ok=false signals the caller to mark the endpoint
+// dead for the remainder of the Scrape. A nil result with ok=true means the
+// tracker simply didn't know about this hash (empty swarm), not that it's
+// broken.
+func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte) (map[string]trackers.Response, bool) {
 	out := make(map[string]trackers.Response)
 
 	host := strings.TrimPrefix(endpoint, "udp://")
@@ -103,25 +130,27 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 	}
 	addr, err := net.ResolveUDPAddr("udp", host)
 	if err != nil {
-		return out
+		return out, false
 	}
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		return out
+		return out, false
 	}
 	defer conn.Close()
+	// Drive both Read/Write deadlines off the inner ctx so one stuck endpoint
+	// cannot outlast the per-request budget.
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
 	}
 
 	connID, err := udpConnect(conn)
 	if err != nil {
-		return out
+		return out, false
 	}
 
 	txid, err := randomUint32()
 	if err != nil {
-		return out
+		return out, true
 	}
 
 	// BEP 15 announce request layout — 98 bytes total, no trailing extensions:
@@ -157,7 +186,7 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 
 	_ = conn.SetWriteDeadline(time.Now().Add(udpScrapeTimeout))
 	if _, err := conn.Write(req); err != nil {
-		return out
+		return out, false
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(udpScrapeTimeout))
 
@@ -165,22 +194,22 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 	buf := make([]byte, 20+6*200+64)
 	n, err := conn.Read(buf)
 	if err != nil {
-		return out
+		return out, false
 	}
 	if n < 20 {
-		return out
+		return out, false
 	}
 	resp := buf[:n]
 	action := binary.BigEndian.Uint32(resp[0:4])
 	gotTxID := binary.BigEndian.Uint32(resp[4:8])
 	if gotTxID != txid {
-		return out
+		return out, false
 	}
 	if action == udpActError {
-		return out
+		return out, true // tracker is alive, just didn't like us — do not mark dead
 	}
 	if action != udpActAnnounce {
-		return out
+		return out, false
 	}
 	// interval at resp[8:12] — ignored; we're not rescheduling by tracker advice.
 	leechers := binary.BigEndian.Uint32(resp[12:16])
@@ -193,7 +222,7 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 	// If swarm is empty by tracker account, treat as not-found to avoid
 	// wiping smarter sources' data. Otherwise record this tracker's view.
 	if seeders == 0 && leechers == 0 && peerCount == 0 {
-		return out
+		return out, true
 	}
 	out[hexHash] = trackers.Response{
 		Status: trackers.StatusOK,
@@ -204,7 +233,7 @@ func announceUDPOne(ctx context.Context, endpoint, hexHash string, raw [20]byte)
 			PeerCount: peerCount,
 		},
 	}
-	return out
+	return out, true
 }
 
 // formatCompactPeer is unused directly today — the peer list is counted but

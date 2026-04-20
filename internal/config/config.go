@@ -35,6 +35,7 @@ type Config struct {
 	DHTLookupTimeout      time.Duration // budget for one hash on one client
 	DHTAlpha              int           // Kademlia parallelism factor
 	DHTClients            int           // DHT pool size (distinct node ids / sockets)
+	DHTClients6           int           // IPv6 DHT pool size; 0 disables IPv6 walk
 	KinozalRateLimit      int           // req/sec
 	RutrackerRateLimit    int           // req/sec
 
@@ -66,6 +67,16 @@ type Config struct {
 	DHTPassivePeerTTL         time.Duration
 	DHTPassiveJanitorInterval time.Duration
 	DHTPassiveMaxPerHash      int
+
+	// BEP 51 sample_infohashes crawler. Enables a background goroutine that
+	// periodically walks the DHT and collects random samples of indexed
+	// infohashes, writing them to the `discovered_hashes` table. Cheap
+	// (one dedicated UDP socket, bounded cycles) and opt-in.
+	DHTBEP51Enabled      bool
+	DHTBEP51Interval     time.Duration
+	DHTBEP51MaxNodes     int
+	DHTBEP51Alpha        int
+	DHTBEP51QueryTimeout time.Duration
 }
 
 func Load() (*Config, error) {
@@ -111,6 +122,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.DHTClients, err = atoi("DHT_CLIENTS", "4"); err != nil {
+		return nil, err
+	}
+	if c.DHTClients6, err = atoi("DHT_CLIENTS_V6", "2"); err != nil {
 		return nil, err
 	}
 	if c.DHTLookupTimeout, err = dur("DHT_LOOKUP_TIMEOUT", "12s"); err != nil {
@@ -168,6 +182,22 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.DHTPassiveMaxPerHash, err = atoi("DHT_PASSIVE_MAX_PER_HASH", "500"); err != nil {
+		return nil, err
+	}
+
+	// BEP 51 sample_infohashes crawler.
+	c.DHTBEP51Enabled = strings.EqualFold(getenv("DHT_BEP51_ENABLED", "1"), "1") ||
+		strings.EqualFold(getenv("DHT_BEP51_ENABLED", "1"), "true")
+	if c.DHTBEP51Interval, err = dur("DHT_BEP51_INTERVAL", "10m"); err != nil {
+		return nil, err
+	}
+	if c.DHTBEP51MaxNodes, err = atoi("DHT_BEP51_MAX_NODES", "100"); err != nil {
+		return nil, err
+	}
+	if c.DHTBEP51Alpha, err = atoi("DHT_BEP51_ALPHA", "8"); err != nil {
+		return nil, err
+	}
+	if c.DHTBEP51QueryTimeout, err = dur("DHT_BEP51_QUERY_TIMEOUT", "2s"); err != nil {
 		return nil, err
 	}
 

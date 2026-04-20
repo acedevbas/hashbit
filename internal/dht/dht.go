@@ -63,6 +63,18 @@ type node struct {
 	addr *net.UDPAddr
 }
 
+// network identifies the address family a Client is bound to. "udp4" and
+// "udp6" are the only accepted values; the zero string is treated as udp4
+// for backwards-compatibility with callers of the original NewClient.
+func normalizeNetwork(n string) string {
+	switch n {
+	case "udp6":
+		return "udp6"
+	default:
+		return "udp4"
+	}
+}
+
 // Options configures one Lookup. Zero-valued fields pick sensible defaults.
 type Options struct {
 	Bootstrap    []string
@@ -120,6 +132,12 @@ type Client struct {
 	conn   *net.UDPConn
 	selfID NodeID
 
+	// network is "udp4" or "udp6". Used for bootstrap resolution so an IPv6
+	// client resolves DefaultBootstrap hostnames to AAAA records and walks
+	// the IPv6 keyspace exclusively. A mixed IPv4/IPv6 pool is built by
+	// constructing one Client per family.
+	network string
+
 	// extMu guards externalIP. Reads hit the fast path on every dispatched
 	// reply (hundreds per second during a lookup), writes happen at most once
 	// per IP change — RWMutex trades one extra atomic per read for lockless
@@ -128,12 +146,25 @@ type Client struct {
 	externalIP net.IP
 }
 
+// Network returns "udp4" or "udp6" — the address family this client is
+// bound to. Callers that need to route traffic along a specific family
+// can use this to pick between clients in a mixed pool.
+func (c *Client) Network() string { return c.network }
+
 // NewClient binds a new IPv4 UDP socket on an OS-chosen port, generates a
 // random node id, and starts the KRPC dispatcher. The client is usable
 // immediately after this returns. The id is upgraded to a BEP 42 derivation
 // automatically the first time a peer echoes our observed public IPv4.
 func NewClient() (*Client, error) {
-	return newClient(nil)
+	return newClient("udp4", nil)
+}
+
+// NewClient6 is the IPv6 variant. Same behaviour as NewClient but binds
+// udp6 and resolves bootstrap hostnames to AAAA records. Nodes returned
+// over the v6 socket are exclusively IPv6, and the client yields IPv6 peer
+// strings formatted as `[addr]:port`.
+func NewClient6() (*Client, error) {
+	return newClient("udp6", nil)
 }
 
 // NewClientWithIP seeds the client with a BEP 42-compliant id derived from
@@ -141,15 +172,16 @@ func NewClient() (*Client, error) {
 // external address (e.g. via STUN or a prior lookup), since it avoids the
 // first-query window where peers still see a random id.
 func NewClientWithIP(ip net.IP) (*Client, error) {
-	return newClient(ip)
+	return newClient("udp4", ip)
 }
 
-func newClient(ip net.IP) (*Client, error) {
+func newClient(network string, ip net.IP) (*Client, error) {
+	network = normalizeNetwork(network)
 	var (
 		selfID NodeID
 		err    error
 	)
-	if ip4 := ip.To4(); ip4 != nil {
+	if ip4 := ip.To4(); ip4 != nil && network == "udp4" {
 		selfID, err = bep42NodeID(ip4)
 	} else {
 		_, err = rand.Read(selfID[:])
@@ -157,13 +189,19 @@ func newClient(ip net.IP) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gen id: %w", err)
 	}
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	var laddr *net.UDPAddr
+	if network == "udp6" {
+		laddr = &net.UDPAddr{IP: net.IPv6unspecified, Port: 0}
+	} else {
+		laddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	}
+	conn, err := net.ListenUDP(network, laddr)
 	if err != nil {
-		return nil, fmt.Errorf("udp listen: %w", err)
+		return nil, fmt.Errorf("udp listen %s: %w", network, err)
 	}
 	srv := newServer(conn, selfID)
-	c := &Client{srv: srv, conn: conn, selfID: selfID}
-	if ip4 := ip.To4(); ip4 != nil {
+	c := &Client{srv: srv, conn: conn, selfID: selfID, network: network}
+	if ip4 := ip.To4(); ip4 != nil && network == "udp4" {
 		c.externalIP = append(net.IP(nil), ip4...)
 	}
 	srv.onObservedIP = c.observeIP
@@ -255,7 +293,7 @@ func (c *Client) Lookup(ctx context.Context, infohash [IDLen]byte, opts Options)
 
 	target := NodeID(infohash)
 
-	bsAddrs := resolveBootstrap(opts.Bootstrap)
+	bsAddrs := resolveBootstrapNetwork(opts.Bootstrap, c.network)
 	if len(bsAddrs) == 0 {
 		return nil, errors.New("no bootstrap nodes resolved")
 	}
@@ -306,6 +344,12 @@ func (c *Client) Lookup(ctx context.Context, infohash [IDLen]byte, opts Options)
 					continue
 				}
 				if !usableIP(nn.addr.IP) || nn.addr.Port == 0 {
+					continue
+				}
+				// Filter nodes by our socket family: a udp4 socket can't dial
+				// an IPv6 address and vice versa. Mixed replies commonly
+				// arrive because we set want=["n4","n6"] in every query.
+				if !matchesNetwork(c.network, nn.addr.IP) {
 					continue
 				}
 				seen[key] = true
@@ -439,6 +483,34 @@ func (c *Client) Lookup(ctx context.Context, infohash [IDLen]byte, opts Options)
 	return res, nil
 }
 
+// SampleInfoHashes issues a BEP 51 sample_infohashes query to addr. The
+// remote node, if it supports BEP 51, returns a list of 20-byte infohashes
+// currently indexed in its routing table plus a list of closer nodes.
+// Callers walk the keyspace by iteratively following returned nodes.
+// Returns the parsed samples, closer nodes, and the responder's node id.
+func (c *Client) SampleInfoHashes(ctx context.Context, addr *net.UDPAddr, target NodeID, timeout time.Duration) ([][IDLen]byte, []node, NodeID, error) {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	r, err := c.srv.sampleInfoHashes(ctx, addr, target, timeout)
+	if err != nil {
+		return nil, nil, NodeID{}, err
+	}
+	if r.sender == nil {
+		return nil, nil, NodeID{}, errors.New("empty response")
+	}
+	return r.samples, r.nodes, r.nodeID, nil
+}
+
+// BootstrapAddrs returns the default Mainline bootstrap endpoints already
+// resolved to *net.UDPAddr. Exposed for the BEP 51 crawler which needs to
+// seed its walk from known good nodes — callers outside this package should
+// not construct the node list manually because DefaultBootstrap uses
+// hostnames that must be DNS-resolved first.
+func BootstrapAddrs() []*net.UDPAddr {
+	return resolveBootstrap(DefaultBootstrap)
+}
+
 // Lookup is a convenience wrapper that creates a one-shot Client, runs a
 // single Lookup, and tears down the socket. For bulk scraping prefer
 // NewClient + client.Lookup: it reuses one socket across many queries.
@@ -464,6 +536,12 @@ type response struct {
 	hasBF   bool
 	bfSeeds [256]byte
 	bfPeers [256]byte
+
+	// BEP 51: samples is populated when this response is the reply to a
+	// sample_infohashes query. Each entry is a 20-byte raw infohash the
+	// remote node is currently tracking. Length is bounded by the responder
+	// (usually ≤20 samples per call by spec recommendation).
+	samples [][IDLen]byte
 }
 
 type server struct {
@@ -583,13 +661,34 @@ func (s *server) dispatch(data []byte, src *net.UDPAddr) {
 			}
 		}
 	}
-	// nodes: concatenated 26-byte compact nodes
+	// nodes: concatenated 26-byte compact IPv4 nodes.
 	if nb, ok := bencode.DictBytes(r, "nodes"); ok {
 		for i := 0; i+26 <= len(nb); i += 26 {
 			var nid NodeID
 			copy(nid[:], nb[i:i+20])
 			ip := net.IPv4(nb[i+20], nb[i+21], nb[i+22], nb[i+23])
 			port := binary.BigEndian.Uint16(nb[i+24 : i+26])
+			if port == 0 {
+				continue
+			}
+			resp.nodes = append(resp.nodes, node{
+				id:   nid,
+				addr: &net.UDPAddr{IP: ip, Port: int(port)},
+			})
+		}
+	}
+	// nodes6 (BEP 32): concatenated 38-byte compact IPv6 nodes. Parsed
+	// unconditionally so that dual-stack responders received over an IPv6
+	// socket yield usable closer-nodes, and v4 clients that happened to
+	// receive nodes6 in a mixed reply simply ignore them later when
+	// usableIP returns true but the address family mismatches the dialer.
+	if nb, ok := bencode.DictBytes(r, "nodes6"); ok {
+		const entry = 38
+		for i := 0; i+entry <= len(nb); i += entry {
+			var nid NodeID
+			copy(nid[:], nb[i:i+20])
+			ip := net.IP(append([]byte(nil), nb[i+20:i+36]...))
+			port := binary.BigEndian.Uint16(nb[i+36 : i+38])
 			if port == 0 {
 				continue
 			}
@@ -608,6 +707,17 @@ func (s *server) dispatch(data []byte, src *net.UDPAddr) {
 		copy(resp.bfPeers[:], bf)
 		resp.hasBF = true
 	}
+	// BEP 51 sample_infohashes reply: a "samples" byte-string whose length is
+	// a multiple of 20. Each 20-byte slice is one infohash currently indexed
+	// by the responding node. Dispatched here so a single read loop serves
+	// both get_peers and sample_infohashes replies.
+	if samplesB, ok := bencode.DictBytes(r, "samples"); ok && len(samplesB) >= IDLen && len(samplesB)%IDLen == 0 {
+		n := len(samplesB) / IDLen
+		resp.samples = make([][IDLen]byte, n)
+		for i := 0; i < n; i++ {
+			copy(resp.samples[i][:], samplesB[i*IDLen:(i+1)*IDLen])
+		}
+	}
 	s.deliver(txid, resp)
 }
 
@@ -624,6 +734,43 @@ func (s *server) deliver(txid uint32, r response) {
 	select {
 	case ch <- r:
 	default:
+	}
+}
+
+// sampleInfoHashes issues a BEP 51 sample_infohashes query to addr and waits
+// for the reply. The target is a random 20-byte id used purely for protocol
+// compliance — BEP 51 responders return samples of their stored hashes
+// regardless of the target. Returns the parsed response or a timeout.
+func (s *server) sampleInfoHashes(ctx context.Context, addr *net.UDPAddr, target NodeID, timeout time.Duration) (response, error) {
+	s.mu.Lock()
+	s.txSeq++
+	txid := s.txSeq
+	ch := make(chan response, 1)
+	s.pending[txid] = ch
+	selfID := s.selfID
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.pending, txid)
+		s.mu.Unlock()
+	}()
+
+	var txB [4]byte
+	binary.BigEndian.PutUint32(txB[:], txid)
+	msg := encodeSampleInfoHashes(txB, selfID, target)
+	if _, err := s.conn.WriteToUDP(msg, addr); err != nil {
+		return response{}, err
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r, nil
+	case <-timer.C:
+		return response{}, errors.New("sample_infohashes timeout")
+	case <-ctx.Done():
+		return response{}, ctx.Err()
 	}
 }
 
@@ -660,6 +807,22 @@ func (s *server) getPeers(ctx context.Context, addr *net.UDPAddr, target NodeID,
 	case <-ctx.Done():
 		return response{}, ctx.Err()
 	}
+}
+
+// encodeSampleInfoHashes serializes a BEP 51 sample_infohashes query. Keys
+// inside "a" are lexicographic: id < target.
+//
+//	d1:ad2:id20:<self_id>6:target20:<target>e1:q17:sample_infohashes1:t4:<tx>1:y1:qe
+func encodeSampleInfoHashes(txid [4]byte, selfID NodeID, target NodeID) []byte {
+	buf := make([]byte, 0, 96)
+	buf = append(buf, "d1:ad2:id20:"...)
+	buf = append(buf, selfID[:]...)
+	buf = append(buf, "6:target20:"...)
+	buf = append(buf, target[:]...)
+	buf = append(buf, "e1:q17:sample_infohashes1:t4:"...)
+	buf = append(buf, txid[:]...)
+	buf = append(buf, "1:y1:qe"...)
+	return buf
 }
 
 // encodeGetPeers serializes a fixed-shape KRPC query. Set keys in args are
@@ -719,14 +882,38 @@ func estimateSwarmSize(bf [256]byte) int {
 // --- helpers ---
 
 func resolveBootstrap(hosts []string) []*net.UDPAddr {
+	return resolveBootstrapNetwork(hosts, "udp4")
+}
+
+// resolveBootstrapNetwork resolves hostnames using the specified network
+// family. "udp4" picks the A record, "udp6" picks AAAA. Hosts without a
+// record in the requested family are silently skipped — this keeps the
+// v4 and v6 pools independent even when only a subset of the default
+// bootstrap list has dual-stack presence.
+func resolveBootstrapNetwork(hosts []string, network string) []*net.UDPAddr {
+	network = normalizeNetwork(network)
 	out := make([]*net.UDPAddr, 0, len(hosts))
 	for _, h := range hosts {
-		a, err := net.ResolveUDPAddr("udp4", h)
+		a, err := net.ResolveUDPAddr(network, h)
 		if err == nil {
 			out = append(out, a)
 		}
 	}
 	return out
+}
+
+// matchesNetwork reports whether an IP is reachable on the client's socket
+// family. "udp4" accepts IPv4; "udp6" accepts IPv6. IPv4-mapped v6 addresses
+// (e.g. ::ffff:1.2.3.4) are treated as IPv4 — they're rare in DHT replies
+// but match what the kernel would dial anyway.
+func matchesNetwork(network string, ip net.IP) bool {
+	isV4 := ip.To4() != nil
+	switch normalizeNetwork(network) {
+	case "udp6":
+		return !isV4
+	default:
+		return isV4
+	}
 }
 
 // usableIP drops addresses that cannot yield useful BitTorrent peers: LAN,

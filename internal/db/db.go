@@ -105,6 +105,21 @@ CREATE INDEX IF NOT EXISTS idx_dht_passive_recent
 -- last_seen-only index is materially faster than the composite above.
 CREATE INDEX IF NOT EXISTS idx_dht_passive_last_seen
     ON dht_passive_peers (last_seen);
+
+-- BEP 51 sample_infohashes discovery log. Separate from infohashes because
+-- these are candidate hashes we haven't committed to scraping yet — they
+-- may be spam, private-torrent shards, or genuinely interesting content.
+-- A downstream process (or the operator) promotes rows into infohashes
+-- on their own schedule.
+CREATE TABLE IF NOT EXISTS discovered_hashes (
+    infohash     CHAR(40) PRIMARY KEY,
+    first_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    seen_count   INTEGER     NOT NULL DEFAULT 1,
+    source_node  TEXT                                     -- IP:port of first reporting node
+);
+CREATE INDEX IF NOT EXISTS idx_discovered_last_seen ON discovered_hashes (last_seen);
+CREATE INDEX IF NOT EXISTS idx_discovered_first_seen ON discovered_hashes (first_seen);
 `
 
 // New opens a pgx pool, waits for the DB to become available, and runs migrations.
@@ -247,6 +262,18 @@ func WriteTrackerResults(
 
 	updBatch := &pgx.Batch{}
 	for _, r := range results {
+		// Once-alive hashes (peak_peer_count > 0) get a compressed backoff
+		// progression — we've seen them host a live swarm before, so
+		// consecutive zeros are more likely to be variance (swarm churn
+		// during our scrape window, NAT issues, momentary DHT partition)
+		// than a permanently-dead hash. Compressed ladder: alive→10m
+		// through <5 zeros, then dead1 through <15, then dead2 through <30,
+		// finally fall back to dead_long. Hashes that have never been seen
+		// alive still go through the original 3/10 ladder so we don't churn
+		// on permanently-dead hashes that were added cold.
+		//
+		// Join via scalar subquery on the PK — planner uses the infohashes
+		// pkey index, ~free compared to the UPDATE itself.
 		updBatch.Queue(`
             UPDATE tracker_state SET
                 seeders     = $3,
@@ -260,6 +287,13 @@ func WriteTrackerResults(
                     CASE
                         WHEN $7 = 'ok' AND (COALESCE($3, 0) > 0 OR COALESCE($6, 0) > 0)
                              THEN $9::INTERVAL
+                        WHEN COALESCE((SELECT peak_peer_count FROM infohashes WHERE infohash = $1), 0) > 0 THEN
+                            CASE
+                                WHEN consecutive_zero_scrapes < 5  THEN INTERVAL '10 minutes'
+                                WHEN consecutive_zero_scrapes < 15 THEN $10::INTERVAL
+                                WHEN consecutive_zero_scrapes < 30 THEN $11::INTERVAL
+                                ELSE                                    $12::INTERVAL
+                            END
                         WHEN consecutive_zero_scrapes < 3  THEN $10::INTERVAL
                         WHEN consecutive_zero_scrapes < 10 THEN $11::INTERVAL
                         ELSE                                    $12::INTERVAL
@@ -507,6 +541,30 @@ func FreshPassivePeers(ctx context.Context, pool *pgxpool.Pool, infohash string,
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// RecordDiscoveredHash UPSERTs one BEP 51 sample observation. Returns true
+// if the row was new (infohash had never been seen before this call); false
+// if it was a repeat observation. Used by the crawler to increment metrics
+// for "novel discoveries" separately from "reaffirmations".
+func RecordDiscoveredHash(ctx context.Context, pool *pgxpool.Pool, infohash, sourceNode string) (bool, error) {
+	// xmax = 0 in the RETURNING clause signals a fresh INSERT (not an UPDATE
+	// caused by the ON CONFLICT branch), letting us count "first seen" vs
+	// "already known" without a prior SELECT.
+	var inserted bool
+	err := pool.QueryRow(ctx, `
+        INSERT INTO discovered_hashes (infohash, source_node)
+        VALUES ($1, $2)
+        ON CONFLICT (infohash) DO UPDATE
+            SET last_seen = NOW(),
+                seen_count = discovered_hashes.seen_count + 1
+        RETURNING (xmax = 0)`,
+		infohash, sourceNode,
+	).Scan(&inserted)
+	if err != nil {
+		return false, err
+	}
+	return inserted, nil
 }
 
 // PassivePeersExpireOlderThan deletes observations older than `cutoff`.

@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,10 +21,20 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/acedevbas/hashbit/internal/btprobe"
 	"github.com/acedevbas/hashbit/internal/db"
+	"github.com/acedevbas/hashbit/internal/metrics"
 	"github.com/acedevbas/hashbit/internal/scheduler"
 	"github.com/acedevbas/hashbit/internal/trackers"
 )
+
+// PeerSource abstracts the backend that supplies raw peer addresses for the
+// /fingerprint endpoint. Implemented by dhtscraper.Scraper; injected here
+// as an interface so api tests can stub it and so we avoid an import cycle
+// with the dhtscraper package.
+type PeerSource interface {
+	PeersForHash(ctx context.Context, hexHash string) ([]string, error)
+}
 
 var hashRE = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 
@@ -33,6 +45,9 @@ type Server struct {
 	// Per-tracker scrapers, used for on-demand ("force") scrape.
 	Scrapers        map[string]scheduler.Scraper
 	OnDemandTimeout time.Duration
+	// Peers provides raw peer-address lookup for the /fingerprint endpoint.
+	// Nil = fingerprint endpoint returns 503.
+	Peers PeerSource
 }
 
 func (s *Server) Routes() http.Handler {
@@ -42,8 +57,12 @@ func (s *Server) Routes() http.Handler {
 	r.Use(requestLogger(s.Log))
 	r.Use(middleware.Recoverer)
 
-	// Public endpoint (no auth) — health check.
+	// Public endpoints (no auth) — health and Prometheus scrape target.
+	// /metrics is intentionally unauthenticated because Prometheus scrapers
+	// inside the private network do not carry tokens; if the service is
+	// exposed to the internet the reverse proxy should restrict by IP.
 	r.Get("/health", s.health)
+	r.Method(http.MethodGet, "/metrics", metrics.Handler())
 
 	// Authenticated endpoints.
 	r.Group(func(r chi.Router) {
@@ -52,6 +71,7 @@ func (s *Server) Routes() http.Handler {
 		r.Post("/hashes", s.addHashes)
 		r.Post("/hashes/query", s.queryHashes)
 		r.Get("/hash/{infohash}", s.getHash)
+		r.Get("/hash/{infohash}/fingerprint", s.fingerprint)
 	})
 
 	return r
@@ -359,6 +379,121 @@ func (s *Server) getHash(w http.ResponseWriter, r *http.Request) {
 		"peak_peer_count": stats.PeakPeerCount,
 		"last_nonzero_at": stats.LastNonzeroAt,
 		"per_tracker":     per,
+	})
+}
+
+// GET /hash/{infohash}/fingerprint?peers=N&timeout=Xs&pex=1
+//
+// Returns confirmed seed/leecher counts by opening a BT TCP+μTP handshake
+// with up to N peers (default 30, max 150) and reading each peer's first
+// HAVE_ALL / HAVE_NONE / bitfield message. Unlike BEP 33 bloom-filter
+// estimates this is a ground-truth count — a peer is only classified as a
+// seed if its own handshake reply declares so.
+//
+// Also harvests fresh peer addresses via ut_pex (BEP 11) from every peer
+// that supports it; those appear in `new_pex_peers` and are a free
+// discovery source for the operator.
+//
+// Costs: one TCP socket + one μTP socket per peer, held open for up to
+// `timeout`. At N=30 with timeout=5s that is a 5-second-bounded blocking
+// call. Prefer using sparingly — the endpoint is opt-in per-hash, not a
+// batch replacement for the scheduled scraper workers.
+func (s *Server) fingerprint(w http.ResponseWriter, r *http.Request) {
+	h := strings.ToLower(chi.URLParam(r, "infohash"))
+	if !hashRE.MatchString(h) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid infohash"})
+		return
+	}
+	if s.Peers == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "peer source not configured"})
+		return
+	}
+
+	numPeers := 30
+	if n := r.URL.Query().Get("peers"); n != "" {
+		if v, err := strconv.Atoi(n); err == nil {
+			if v < 1 {
+				v = 1
+			}
+			if v > 150 {
+				v = 150
+			}
+			numPeers = v
+		}
+	}
+	timeout := 5 * time.Second
+	if t := r.URL.Query().Get("timeout"); t != "" {
+		if d, err := time.ParseDuration(t); err == nil {
+			if d < time.Second {
+				d = time.Second
+			}
+			if d > 30*time.Second {
+				d = 30 * time.Second
+			}
+			timeout = d
+		}
+	}
+
+	// Gather peer candidates. We budget twice the requested N so PEX and
+	// per-peer dial failures still leave enough for a meaningful fingerprint.
+	peerCtx, cancelPeers := context.WithTimeout(r.Context(), 20*time.Second)
+	peers, err := s.Peers.PeersForHash(peerCtx, h)
+	cancelPeers()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(peers) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"infohash": h,
+			"peers":    0,
+			"note":     "no peers discovered for this hash",
+		})
+		return
+	}
+	if len(peers) > numPeers {
+		peers = peers[:numPeers]
+	}
+
+	ihBytes, _ := hex.DecodeString(h)
+	var ih [20]byte
+	copy(ih[:], ihBytes)
+
+	fpCtx, cancelFP := context.WithTimeout(r.Context(), timeout+3*time.Second)
+	summary := btprobe.FingerprintPeers(fpCtx, ih, peers, 32, timeout)
+	cancelFP()
+
+	perPeer := make([]map[string]any, 0, len(summary.Results))
+	for _, res := range summary.Results {
+		status := "unknown"
+		switch res.Status {
+		case btprobe.StatusSeed:
+			status = "seed"
+		case btprobe.StatusLeecher:
+			status = "leecher"
+		case btprobe.StatusDead:
+			status = "dead"
+		}
+		perPeer = append(perPeer, map[string]any{
+			"addr":   res.Addr,
+			"proto":  res.Proto,
+			"status": status,
+			"pex":    len(res.PEXPeers),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"infohash":       h,
+		"peers_probed":   summary.Total,
+		"confirmed_seeds":    summary.Seeds,
+		"confirmed_leechers": summary.Leechers,
+		"unknown":         summary.Unknown,
+		"dead":            summary.Dead,
+		"by_tcp":          summary.ByTCP,
+		"by_utp":          summary.ByUTP,
+		"elapsed":         summary.Elapsed.String(),
+		"new_pex_peers":   summary.NewPeers,
+		"per_peer":        perPeer,
 	})
 }
 

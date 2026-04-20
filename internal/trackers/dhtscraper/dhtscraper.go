@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/acedevbas/hashbit/internal/dht"
+	"github.com/acedevbas/hashbit/internal/metrics"
 	"github.com/acedevbas/hashbit/internal/trackers"
 )
 
@@ -94,14 +95,23 @@ func (s *Scraper) SetPassiveCache(c PassiveCache, ttl time.Duration, limit int) 
 // different Kademlia routing paths, so spreading queries across the pool
 // materially broadens swarm coverage.
 //
+// numClients is the IPv4 pool size. numClients6 (can be 0) adds a parallel
+// IPv6 pool — v6 clients walk the v6 keyspace via AAAA-resolved bootstraps
+// and return IPv6 peers formatted as [addr]:port. IPv6 coverage typically
+// adds 20-30% new peers on mainstream hashes because IPv6-only clients
+// never appear in the v4 pool's replies.
+//
 // concurrency caps simultaneous per-hash operations across the whole pool
-// (one hash fans out to numClients lookups, each taking one slot). A slot
-// pool of 64 with numClients=4 lets 16 hashes execute in parallel.
+// (one hash fans out to N clients, each taking one slot). A slot pool of 64
+// with 4 clients lets 16 hashes execute in parallel.
 //
 // lookupTimeout bounds one hash on one client. alpha is Kademlia α.
-func New(numClients, concurrency int, lookupTimeout time.Duration, alpha int) (*Scraper, error) {
+func New(numClients, numClients6, concurrency int, lookupTimeout time.Duration, alpha int) (*Scraper, error) {
 	if numClients <= 0 {
 		numClients = 1
+	}
+	if numClients6 < 0 {
+		numClients6 = 0
 	}
 	if concurrency <= 0 {
 		concurrency = 32
@@ -112,7 +122,7 @@ func New(numClients, concurrency int, lookupTimeout time.Duration, alpha int) (*
 	if alpha <= 0 {
 		alpha = dht.Alpha
 	}
-	clients := make([]*dht.Client, 0, numClients)
+	clients := make([]*dht.Client, 0, numClients+numClients6)
 	for i := 0; i < numClients; i++ {
 		c, err := dht.NewClient()
 		if err != nil {
@@ -120,6 +130,17 @@ func New(numClients, concurrency int, lookupTimeout time.Duration, alpha int) (*
 				_ = existing.Close()
 			}
 			return nil, err
+		}
+		clients = append(clients, c)
+	}
+	for i := 0; i < numClients6; i++ {
+		c, err := dht.NewClient6()
+		if err != nil {
+			// IPv6 is a nice-to-have. If the host lacks working IPv6 (no
+			// default route, kernel IPv6 disabled) don't abort — log and
+			// keep what we built so far. Degrading gracefully to v4-only is
+			// strictly better than refusing to start.
+			break
 		}
 		clients = append(clients, c)
 	}
@@ -136,6 +157,89 @@ func New(numClients, concurrency int, lookupTimeout time.Duration, alpha int) (*
 		opts:        dht.Options{Timeout: lookupTimeout, Alpha: alpha},
 		rescue:      rescue,
 	}, nil
+}
+
+// PeersForHash runs a one-shot active DHT lookup across every client in the
+// pool plus (if configured) the passive cache, and returns the union of
+// peer endpoints. Used by the on-demand fingerprint API where callers want
+// raw peer addresses rather than the aggregated-counts response.
+//
+// The lookup is bounded by the scraper's configured lookupTimeout per
+// client, plus up to 30s for the anacrolix rescue client. Callers that
+// need a tighter budget should pass a shorter ctx deadline — each
+// Client.Lookup respects ctx cancellation.
+func (s *Scraper) PeersForHash(ctx context.Context, hexHash string) ([]string, error) {
+	raw, err := hex.DecodeString(hexHash)
+	if err != nil || len(raw) != 20 {
+		return nil, err
+	}
+	var ih [20]byte
+	copy(ih[:], raw)
+
+	peersSet := make(map[string]struct{})
+
+	if s.passiveCache != nil {
+		cacheCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		if fresh, err := s.passiveCache.FreshPeers(cacheCtx, hexHash, s.passivePeerTTL, s.passivePeerCap); err == nil {
+			for _, p := range fresh {
+				peersSet[p] = struct{}{}
+			}
+		}
+		cancel()
+	}
+
+	// Fan out to the pool; unlike Scrape we don't bother with the shared
+	// concurrency semaphore — this is a one-shot, interactive call, not
+	// part of a batch tick.
+	type outcome struct {
+		peers []string
+		err   error
+	}
+	outCh := make(chan outcome, len(s.clients))
+	for _, c := range s.clients {
+		go func(c *dht.Client) {
+			r, err := c.Lookup(ctx, ih, s.opts)
+			if err != nil {
+				outCh <- outcome{err: err}
+				return
+			}
+			outCh <- outcome{peers: r.Peers}
+		}(c)
+	}
+	for i := 0; i < len(s.clients); i++ {
+		o := <-outCh
+		if o.err != nil {
+			continue
+		}
+		for _, p := range o.peers {
+			peersSet[p] = struct{}{}
+		}
+	}
+
+	// Rescue path: if the active fan-out returned nothing, try anacrolix.
+	// Bounded by its own timeout so we don't stretch the API call.
+	if len(peersSet) == 0 && s.rescue != nil {
+		r, err := s.rescue.Lookup(ctx, ih, 15*time.Second)
+		if err == nil {
+			for _, p := range r.Peers {
+				peersSet[p] = struct{}{}
+			}
+		}
+	}
+
+	// Pin any fresh observations into the passive cache so the next query
+	// for this hash gets them without network round-trip.
+	if s.passiveCache != nil && len(peersSet) > 0 {
+		for p := range peersSet {
+			s.passiveCache.Record(hexHash, p)
+		}
+	}
+
+	out := make([]string, 0, len(peersSet))
+	for p := range peersSet {
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 // Close releases every underlying DHT socket. Safe to call once at shutdown.
@@ -284,6 +388,11 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 	// extra Lookup per empty hash but rescue ~60 % of the small-swarm
 	// false-negatives (production probe confirmed 8 peers on a hash our
 	// batch reported as zero). Popular hashes never hit this branch.
+	// Record metrics from the main fan-out before potentially branching into
+	// rescue so the numerator "peers per active lookup" stays clean.
+	metrics.AddDHTPeers(len(peersSet))
+	metrics.AddDHTBEP33Responders(totalBEP33)
+
 	if len(peersSet) == 0 && totalBEP33 == 0 && s.rescue != nil {
 		// Rescue via anacrolix/dht. Our hand-rolled iterative lookup
 		// converges too early on small-swarm hashes (bootstrap returns no
@@ -301,6 +410,7 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 				defer func() { <-sem }()
 				r, err := s.rescue.Lookup(ctx, ih, 30*time.Second)
 				if err != nil {
+					metrics.IncDHTRescue("error")
 					return
 				}
 				for _, p := range r.Peers {
@@ -312,6 +422,16 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 						fusedSeeds[j] |= r.MergedBFSeeds[j]
 						fusedPeers[j] |= r.MergedBFPeers[j]
 					}
+				}
+				switch {
+				case len(r.Peers) > 0:
+					metrics.IncDHTRescue("peers")
+					metrics.AddDHTPeers(len(r.Peers))
+				case r.BEP33Responders > 0:
+					metrics.IncDHTRescue("bep33")
+					metrics.AddDHTBEP33Responders(r.BEP33Responders)
+				default:
+					metrics.IncDHTRescue("empty")
 				}
 			}()
 		case <-ctx.Done():

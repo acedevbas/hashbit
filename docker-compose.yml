@@ -62,10 +62,12 @@ services:
       # counts — heavier, but dramatically increases peer discovery for heavy
       # hashes. "1" enables BOTH UDP and HTTP announce layers; "0" keeps only
       # scrape (scrape-only is fast but yields counts only, no peer list).
-      # DISABLED pending fix for the announce-layer hang on stuck goroutines
-      # (one dead tracker can block the whole Scrape() call); enable once
-      # per-request ctx timeouts are in place.
-      PUBLIC_ANNOUNCE:    "0"
+      # Enabled — announce goroutines now use per-request ctx timeouts
+      # (udpAnnounceBudget=4s, httpAnnounceBudget=5s) and a per-Scrape
+      # endpoint health breaker that skips further hashes on a tracker that
+      # fails its first contact, so one stuck tracker no longer stalls the
+      # fan-out.
+      PUBLIC_ANNOUNCE:    "1"
 
       # Auto-refresh of public tracker endpoint lists from ngosang/trackerslist.
       # Default 6h keeps the list fresh without hammering GitHub. Set to "0"
@@ -77,7 +79,14 @@ services:
 
       # ---- DHT scraper (Mainline DHT get_peers + BEP 32 IPv6 + BEP 33 bloom-filter) ----
       DHT_BATCH_SIZE:     "100"   # hashes per tick
-      DHT_CLIENTS:        "4"     # pool size: N independent sockets/node-ids querying in parallel
+      DHT_CLIENTS:        "4"     # IPv4 pool size: N independent sockets/node-ids querying in parallel
+      # IPv6 pool — binds udp6 sockets and walks the v6 keyspace via AAAA-
+      # resolved bootstraps. Adds 20-30% fresh peers for mainstream hashes
+      # (IPv6-only clients never surface through the v4 walk). Requires the
+      # host AND the Docker network to have working IPv6 (default bridge is
+      # IPv4-only; enable with `docker network create --ipv6` or
+      # `network_mode: host` here). Degrades gracefully if binding fails.
+      DHT_CLIENTS_V6:     "2"
       DHT_CONCURRENCY:    "64"    # total concurrent ops across the pool
       DHT_ALPHA:          "8"     # Kademlia α parallelism per lookup
       DHT_LOOKUP_TIMEOUT: "12s"   # budget per (hash, client)
@@ -92,6 +101,18 @@ services:
       DHT_PASSIVE_PEER_TTL:         "30m"   # how long a cached peer counts as "fresh"
       DHT_PASSIVE_JANITOR_INTERVAL: "1h"    # janitor wake-up for stale-row deletion
       DHT_PASSIVE_MAX_PER_HASH:     "500"   # cap per-hash writes to bound table growth
+
+      # ---- BEP 51 sample_infohashes discovery crawler ----
+      # Periodically walks the DHT asking responding nodes "what hashes do you
+      # know about?" via BEP 51. Discovered hashes land in the
+      # `discovered_hashes` table — a log of public metadata that the operator
+      # promotes into `infohashes` on their own schedule. Uses its own UDP
+      # socket, so discovery traffic does not compete with scrape throughput.
+      DHT_BEP51_ENABLED:       "1"
+      DHT_BEP51_INTERVAL:      "10m"   # wait between cycles
+      DHT_BEP51_MAX_NODES:     "100"   # unique nodes visited per cycle
+      DHT_BEP51_ALPHA:         "8"     # parallel queries
+      DHT_BEP51_QUERY_TIMEOUT: "2s"
 
       # ---- Rate limits per worker (requests/sec) ----
       KINOZAL_RPS:    "5"

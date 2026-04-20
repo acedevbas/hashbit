@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/acedevbas/hashbit/internal/bencode"
 	"github.com/acedevbas/hashbit/internal/httpclient"
@@ -31,6 +32,9 @@ const (
 	// httpAnnounceLeft is sent as the `left` query param. Zero would signal
 	// "seeding", which some trackers refuse from peers with 0 uploaded.
 	httpAnnounceLeft = 16777216 // 16 MiB — arbitrary non-zero "still downloading"
+
+	// Per-request budget; same rationale as udpAnnounceBudget.
+	httpAnnounceBudget = 5 * time.Second
 )
 
 // announceHTTP fans out BEP 3 /announce requests across all HTTP endpoints for
@@ -56,6 +60,7 @@ func announceHTTP(ctx context.Context, hc *httpclient.Client, endpoints []string
 		return
 	}
 
+	health := newEndpointHealth()
 	var wg sync.WaitGroup
 	for _, ep := range endpoints {
 		announceURL := scrapeToAnnounceURL(ep)
@@ -72,7 +77,15 @@ func announceHTTP(ctx context.Context, hc *httpclient.Client, endpoints []string
 				case <-ctx.Done():
 					return
 				}
-				partial := announceHTTPOne(ctx, hc, endpoint, hexHash, raw)
+				if health.Bad(endpoint) {
+					return
+				}
+				reqCtx, cancel := context.WithTimeout(ctx, httpAnnounceBudget)
+				partial, ok := announceHTTPOne(reqCtx, hc, endpoint, hexHash, raw)
+				cancel()
+				if !ok {
+					health.Mark(endpoint)
+				}
 				if len(partial) == 0 {
 					return
 				}
@@ -99,16 +112,20 @@ func scrapeToAnnounceURL(scrapeURL string) string {
 // announceHTTPOne issues one BEP 3 announce. event=started is intentionally
 // omitted — we re-announce the same hashes every scrape tick, and "started"
 // on each call would tip trackers off to rate-limit us.
-func announceHTTPOne(ctx context.Context, hc *httpclient.Client, announceURL, hexHash string, raw []byte) map[string]trackers.Response {
+//
+// Returns (partial, ok). ok=false signals an endpoint-level failure and the
+// caller should mark the endpoint dead for the remainder of the Scrape;
+// nil partial with ok=true is just "tracker has no data on this hash".
+func announceHTTPOne(ctx context.Context, hc *httpclient.Client, announceURL, hexHash string, raw []byte) (map[string]trackers.Response, bool) {
 	out := make(map[string]trackers.Response)
 
 	peerID, err := generatePeerID()
 	if err != nil {
-		return out
+		return out, true
 	}
 	key, err := generateHexKey(4)
 	if err != nil {
-		return out
+		return out, true
 	}
 
 	// Build query string. url.Values would alphabetize keys; order doesn't matter
@@ -135,18 +152,18 @@ func announceHTTPOne(ctx context.Context, hc *httpclient.Client, announceURL, he
 
 	body, _, err := hc.Get(ctx, sb.String())
 	if err != nil {
-		return out
+		return out, false
 	}
 	v, err := bencode.Decode(body)
 	if err != nil {
-		return out
+		return out, false
 	}
 	top, ok := bencode.AsDict(v)
 	if !ok {
-		return out
+		return out, false
 	}
 	if _, failed := bencode.DictString(top, "failure reason"); failed {
-		return out // tracker rejected the request; don't merge anything
+		return out, true // tracker is alive but rejected this specific request
 	}
 
 	seeds, _ := bencode.DictInt(top, "complete")
@@ -155,7 +172,7 @@ func announceHTTPOne(ctx context.Context, hc *httpclient.Client, announceURL, he
 
 	// Empty swarm per tracker — skip so we don't clobber a mirror with real data.
 	if seeds == 0 && leech == 0 && peerCount == 0 {
-		return out
+		return out, true
 	}
 	out[hexHash] = trackers.Response{
 		Status: trackers.StatusOK,
@@ -166,7 +183,7 @@ func announceHTTPOne(ctx context.Context, hc *httpclient.Client, announceURL, he
 			PeerCount: peerCount,
 		},
 	}
-	return out
+	return out, true
 }
 
 // countAnnouncePeers returns the number of distinct peer entries found in the
