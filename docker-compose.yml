@@ -103,7 +103,13 @@ services:
       TRACKER_TIMEOUT:   "15s"
       ON_DEMAND_TIMEOUT: "10s"
     ports:
-      - "8080:8080"
+      # HTTP API bound to loopback only — production environments terminate
+      # TLS at a reverse proxy (nginx) and upstream to 127.0.0.1:9090.
+      # 9090 instead of 8080 because 8080 is a common collision (nginx
+      # default vhosts, other services) and binding to 0.0.0.0:8080 breaks
+      # co-hosted deployments. Override via compose `ports:` if exposing
+      # directly without a reverse proxy.
+      - "127.0.0.1:9090:8080"
       # CRITICAL: the passive DHT node only works if remote peers can send us
       # UDP datagrams. Without this mapping (or an equivalent firewall rule)
       # we will never be added to anyone's routing table and announce_peer
