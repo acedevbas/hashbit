@@ -34,13 +34,20 @@ import (
 	"github.com/acedevbas/hashbit/internal/trackers"
 )
 
-// PassiveCache is the read interface into the passive DHT's harvested
-// (infohash -> recent peers) store. Defined as an interface so tests (and
-// alternative backends) can substitute a simple in-memory map without
-// pulling the production Postgres-backed implementation. nil is a valid
-// zero — when no cache is wired the scraper behaves exactly as before.
+// PassiveCache is the read-and-write interface into the passive DHT peer
+// store. Defined as an interface so tests (and alternative backends) can
+// substitute a simple in-memory map without pulling the production
+// Postgres-backed implementation. nil is a valid zero — when no cache is
+// wired the scraper behaves exactly as before.
+//
+// Record is called for every peer returned by an active DHT lookup so the
+// store accumulates over time: edge-case small-swarm hashes that only
+// surface intermittently during active queries get pinned as fresh entries
+// and subsequent scrapes can rely on the cache even when the live lookup
+// comes back empty. Record should be non-blocking (buffered / write-behind).
 type PassiveCache interface {
 	FreshPeers(ctx context.Context, infohash string, within time.Duration, limit int) ([]string, error)
+	Record(infohash, peer string)
 }
 
 // Scraper implements scheduler.Scraper using a pool of DHT clients.
@@ -283,6 +290,16 @@ func (s *Scraper) scrapeOne(ctx context.Context, hexHash string, sem chan struct
 				}
 			}
 		case <-ctx.Done():
+		}
+	}
+
+	// Persist every peer we saw into the passive cache so the next scrape of
+	// this hash benefits even if the next active lookup hits a variance-blind
+	// window. Record is write-behind/non-blocking, so this stays off the hot
+	// path. Cached peers inform the pre-consult block above.
+	if s.passiveCache != nil && len(peersSet) > 0 {
+		for p := range peersSet {
+			s.passiveCache.Record(hexHash, p)
 		}
 	}
 
