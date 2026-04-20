@@ -1,3 +1,6 @@
+//go:build cgo
+// +build cgo
+
 // TCP / μTP racing dialer.
 //
 // Modern BitTorrent clients — notably qBittorrent, μTorrent and Transmission —
